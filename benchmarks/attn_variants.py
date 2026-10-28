@@ -27,9 +27,10 @@ PAGE = 16
 def _make(ctx, heads_kv, dtype, device):
     pages = ctx // PAGE + 1
     shape = (pages, PAGE, heads_kv, DIM)
-    if dtype == "e5m2":
-        k = torch.randn(shape, dtype=torch.float16, device=device).to(torch.float8_e5m2)
-        v = torch.randn(shape, dtype=torch.float16, device=device).to(torch.float8_e5m2)
+    if dtype in ("e5m2", "e4m3"):
+        fmt = torch.float8_e5m2 if dtype == "e5m2" else torch.float8_e4m3fn
+        k = torch.randn(shape, dtype=torch.float16, device=device).to(fmt)
+        v = torch.randn(shape, dtype=torch.float16, device=device).to(fmt)
     else:
         k = torch.randn(shape, dtype=torch.float16, device=device)
         v = torch.randn(shape, dtype=torch.float16, device=device)
@@ -42,7 +43,7 @@ def main():
     ap.add_argument("--contexts", default="32768,131072,262144")
     ap.add_argument("--splits", default="80,160,320")
     ap.add_argument("--kv-heads", default="4,2", help="4 = TP1, 2 = TP2")
-    ap.add_argument("--dtype", default="e5m2,fp16")
+    ap.add_argument("--dtype", default="e5m2,e4m3,fp16")
     ap.add_argument("--reps", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=40,
                     help="iterations to run before timing; a V100 idles at "
@@ -66,7 +67,7 @@ def main():
             moved = 2 * ctx * heads_kv * DIM  # K + V bytes, e5m2
             for dtype in args.dtype.split(","):
                 k, v, page_table = _make(ctx, heads_kv, dtype, device)
-                if dtype != "e5m2":
+                if dtype == "fp16":
                     moved *= 2
                 for splits in [int(x) for x in args.splits.split(",")]:
                     row = {}

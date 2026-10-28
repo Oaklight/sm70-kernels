@@ -99,8 +99,11 @@ def sm70_cuda_decode_partial(
     partial_lse = torch.empty(
         (batch, max_splits, heads), dtype=torch.float32, device=q.device
     )
-    fp8 = k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    kv = (lambda t: t.view(torch.uint8)) if fp8 else (lambda t: t)
+    # E5M2 is handed over as raw bytes because the kernel converts it with a
+    # byte shift. E4M3 is passed with its own dtype so the kernel can tell the
+    # two apart and take the general conversion.
+    fp8_e5m2 = k_cache.dtype == torch.float8_e5m2
+    kv = (lambda t: t.view(torch.uint8)) if fp8_e5m2 else (lambda t: t)
     entry = {
         "serial": ext.sm70_longctx_decode,
         "occ2": ext.sm70_longctx_decode_occ2,

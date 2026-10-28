@@ -65,6 +65,51 @@ __device__ __forceinline__ void e5m2_to_fp16_16(const uint4 raw, half* dst) {
   *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(out + 4);
 }
 
+// E4M3 -> FP16 for one 16-byte vector. The E5M2 byte shift above is exact only
+// because E5M2 and FP16 share a sign bit, a five-bit exponent and the same
+// bias; E4M3 has a four-bit exponent with bias 7 and a three-bit mantissa, so
+// it needs real conversion. Normal numbers are a bias shift (e + 8) and a
+// mantissa slide (m << 7); E4M3 subnormals have no implicit leading one and
+// have to be renormalized into FP16, which is normal for them because E4M3's
+// smallest subnormal is 2^-9 and FP16's is 2^-24.
+__device__ __forceinline__ unsigned short e4m3_byte_to_half_ref(const unsigned b) {
+  const unsigned sign = (b & 0x80u) << 8;
+  const int exp = (b >> 3) & 0xFu;
+  const int mant = b & 0x7u;
+  if (exp == 0) {
+    if (mant == 0) {
+      return (unsigned short)sign;  // +-0
+    }
+    const int lead = 31 - __clz((unsigned)mant);
+    const int e16 = 15 - 9 + lead;
+    const int m16 = (mant << (10 - lead)) & 0x3FF;
+    return (unsigned short)(sign | (e16 << 10) | m16);
+  }
+  if (exp == 0xF && mant == 0x7) {
+    return (unsigned short)(sign | 0x7E00u);  // NaN
+  }
+  return (unsigned short)(sign | ((exp + 8) << 10) | (mant << 7));
+}
+
+// The CUDA intrinsic (__nv_cvt_fp8x2_to_halfraw2) is emulated on SM70 and
+// measured 30% slower than this hand-rolled version at 256k (1.238 against
+// 0.951 ms), so the explicit form is what the kernel uses. `_ref` is kept as
+// the readable statement of the encoding that the fast path must match.
+__device__ __forceinline__ void e4m3_to_fp16_16(const uint4 raw, half* dst) {
+  const uint32_t* r = reinterpret_cast<const uint32_t*>(&raw);
+  uint32_t out[8];
+#pragma unroll
+  for (int w = 0; w < 4; ++w) {
+    const uint32_t b = r[w];
+    out[2 * w] = (uint32_t)e4m3_byte_to_half_ref(b & 0xFFu) |
+                 ((uint32_t)e4m3_byte_to_half_ref((b >> 8) & 0xFFu) << 16);
+    out[2 * w + 1] = (uint32_t)e4m3_byte_to_half_ref((b >> 16) & 0xFFu) |
+                     ((uint32_t)e4m3_byte_to_half_ref((b >> 24) & 0xFFu) << 16);
+  }
+  *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(out);
+  *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(out + 4);
+}
+
 // Load one K/V token tile into shared memory. The cache element type selects
 // the read path: the E5M2 byte cache is read as one 16-byte vector per thread
 // and dequantized to FP16; an FP16 cache is read as two 16-byte vectors per
@@ -270,7 +315,7 @@ constexpr int kPipeDynSmemBytes = 2 * 2 * kSmemKV * sizeof(__half);
 // loop that waits on each request caps the grid at a few KB of bytes in flight
 // per SM and lands at ~330 GB/s, while the same code in fp16 (32 bytes per
 // request) reaches 640. batching kIters requests per thread is what closes gap.
-template <typename KV, int kTh, int kIters>
+template <typename KV, int kTh, int kIters, bool kE4M3>
 __device__ __forceinline__ void pipe_load_tile(
     const KV* __restrict__ k_cache, const KV* __restrict__ v_cache,
     const int* __restrict__ page_table, const int seq_id, const int kv_head,
@@ -321,7 +366,12 @@ __device__ __forceinline__ void pipe_load_tile(
     if constexpr (sizeof(KV) == 1) {
       // E5M2 shares the sign/exponent layout with FP16, so one byte becomes one
       // half by shifting left eight bits; 16 bytes become two 16-byte stores.
-      e5m2_to_fp16_16(ra[it], dstv[it]);
+      // E4M3 does not, and takes the general conversion instead.
+      if constexpr (kE4M3) {
+        e4m3_to_fp16_16(ra[it], dstv[it]);
+      } else {
+        e5m2_to_fp16_16(ra[it], dstv[it]);
+      }
     } else {
       uint4* d = reinterpret_cast<uint4*>(dstv[it]);
       d[0] = ra[it];
@@ -333,7 +383,7 @@ __device__ __forceinline__ void pipe_load_tile(
 // kCtas = CTAs resident per SM. At two, the SM interleaves one CTA's load with
 // the other's math for free, and holds twice the bytes in flight - which is the
 // binding constraint for the 16-byte e5m2 reads.
-template <typename KV, int kCtas>
+template <typename KV, int kCtas, bool kE4M3>
 __global__ void __launch_bounds__(kThreads, kCtas)
 decode_partial_kernel(const __half* __restrict__ q,
                       const KV* __restrict__ k_cache,
@@ -426,7 +476,7 @@ decode_partial_kernel(const __half* __restrict__ q,
     const int tile_tokens = min(kBlockN, split_end - tile_begin);
 
     // ---- Cooperative vectorized load + E5M2 -> FP16 convert (K and V) ----
-    pipe_load_tile<KV, kThreads, (2 * kPipeVecPerTensor + kThreads - 1) / kThreads>(
+    pipe_load_tile<KV, kThreads, (2 * kPipeVecPerTensor + kThreads - 1) / kThreads, kE4M3>(
         k_cache, v_cache, page_table, seq_id, kv_head, kv_stride, max_blocks,
         tile_begin, split_end, tid, ks, vs);
     __syncthreads();
@@ -461,7 +511,7 @@ decode_partial_kernel(const __half* __restrict__ q,
   }
 }
 
-template <typename KV>
+template <typename KV, bool kE4M3>
 __global__ void __launch_bounds__(kThreads, 1)
 decode_partial_kernel_pipelined(const __half* __restrict__ q,
                                 const KV* __restrict__ k_cache,
@@ -549,7 +599,7 @@ decode_partial_kernel_pipelined(const __half* __restrict__ q,
   // Prologue: the loader warps fill buffer 0 while everyone else finishes
   // staging the queries.
   if (!is_compute_warp) {
-    pipe_load_tile<KV, kPipeLoadThreads, kPipeLoadIters>(
+    pipe_load_tile<KV, kPipeLoadThreads, kPipeLoadIters, kE4M3>(
         k_cache, v_cache, page_table, seq_id, kv_head, kv_stride, max_blocks,
         split_begin, split_end, ltid, ks0, vs0);
   }
@@ -561,7 +611,7 @@ decode_partial_kernel_pipelined(const __half* __restrict__ q,
       // barrier that ended the previous iteration.
       if (tile + 1 < num_tiles) {
         const int next = (tile + 1) & 1;
-        pipe_load_tile<KV, kPipeLoadThreads, kPipeLoadIters>(
+        pipe_load_tile<KV, kPipeLoadThreads, kPipeLoadIters, kE4M3>(
             k_cache, v_cache, page_table, seq_id, kv_head, kv_stride,
             max_blocks, split_begin + (tile + 1) * kBlockN, split_end, ltid,
             ks0 + next * kSmemKV, vs0 + next * kSmemKV);
@@ -1129,6 +1179,7 @@ struct DecodeArgs {
   float scale_k;
   float vscale;
   bool byte_cache;
+  bool e4m3;  // only meaningful when byte_cache
 };
 
 inline DecodeArgs decode_args(const torch::Tensor& q,
@@ -1147,9 +1198,10 @@ inline DecodeArgs decode_args(const torch::Tensor& q,
               "sm70_longctx expects H6/D256 GQA with a full KV-head split "
               "(TP1 Hkv4, TP2 Hkv2, TP4 Hkv1)");
   TORCH_CHECK((k_cache.scalar_type() == torch::kUInt8 ||
+               k_cache.scalar_type() == torch::kFloat8_e4m3fn ||
                k_cache.scalar_type() == torch::kHalf) &&
                   v_cache.scalar_type() == k_cache.scalar_type(),
-              "sm70_longctx expects an E5M2 byte or FP16 KV cache");
+              "sm70_longctx expects an E5M2 byte, E4M3 or FP16 KV cache");
   TORCH_CHECK(q.dtype() == torch::kHalf, "sm70_longctx expects fp16 queries");
   DecodeArgs a;
   a.grid = dim3((unsigned)heads_kv, (unsigned)max_splits, (unsigned)batch);
@@ -1159,18 +1211,20 @@ inline DecodeArgs decode_args(const torch::Tensor& q,
   a.min_tokens = (int)min_tokens_per_split;
   a.scale_k = (float)(softmax_scale * k_scale);
   a.vscale = (float)v_scale;
-  a.byte_cache = k_cache.scalar_type() == torch::kUInt8;
+  a.byte_cache = k_cache.scalar_type() == torch::kUInt8 ||
+                 k_cache.scalar_type() == torch::kFloat8_e4m3fn;
+  a.e4m3 = k_cache.scalar_type() == torch::kFloat8_e4m3fn;
   return a;
 }
 
-template <typename KV, int kCtas>
+template <typename KV, int kCtas, bool kE4M3>
 inline void launch_serial(const DecodeArgs& a, cudaStream_t stream,
                           const torch::Tensor& q, const torch::Tensor& k_cache,
                           const torch::Tensor& v_cache,
                           const torch::Tensor& seq_lens,
                           torch::Tensor& partial_o,
                           torch::Tensor& partial_lse) {
-  decode_partial_kernel<KV, kCtas><<<a.grid, kThreads, 0, stream>>>(
+  decode_partial_kernel<KV, kCtas, kE4M3><<<a.grid, kThreads, 0, stream>>>(
       reinterpret_cast<const __half*>(q.data_ptr()),
       reinterpret_cast<const KV*>(k_cache.data_ptr()),
       reinterpret_cast<const KV*>(v_cache.data_ptr()), a.page_ptr,
@@ -1187,25 +1241,39 @@ inline void dispatch_serial(const DecodeArgs& a, cudaStream_t stream,
                             const torch::Tensor& seq_lens,
                             torch::Tensor& partial_o,
                             torch::Tensor& partial_lse) {
-  if (a.byte_cache) {
-    launch_serial<uint8_t, kCtas>(a, stream, q, k_cache, v_cache, seq_lens,
-                                  partial_o, partial_lse);
+  if (a.e4m3) {
+    launch_serial<uint8_t, kCtas, true>(a, stream, q, k_cache, v_cache,
+                                        seq_lens, partial_o, partial_lse);
+  } else if (a.byte_cache) {
+    launch_serial<uint8_t, kCtas, false>(a, stream, q, k_cache, v_cache,
+                                         seq_lens, partial_o, partial_lse);
   } else {
-    launch_serial<__half, kCtas>(a, stream, q, k_cache, v_cache, seq_lens,
-                                 partial_o, partial_lse);
+    launch_serial<__half, kCtas, false>(a, stream, q, k_cache, v_cache,
+                                        seq_lens, partial_o, partial_lse);
   }
 }
 
 // Dynamic smem above 48 KB needs the opt-in attribute set once per entry
 // point; V100 allows up to 96 KB with 1 KB reserved.
-template <typename KV>
+// One int rather than <type, bool>: TORCH_CHECK is a macro and the comma in a
+// two-argument template list splits its arguments.
+template <int kVariant>  // 0 = E5M2 bytes, 1 = E4M3, 2 = FP16
 bool pipelined_smem_ready() {
   static const bool ok = [] {
-    return cudaFuncSetAttribute(
-               reinterpret_cast<const void*>(
-                   &decode_partial_kernel_pipelined<KV>),
-               cudaFuncAttributeMaxDynamicSharedMemorySize,
-               kPipeDynSmemBytes) == cudaSuccess;
+    void* entry = nullptr;
+    if constexpr (kVariant == 2) {
+      entry = reinterpret_cast<void*>(
+          &decode_partial_kernel_pipelined<__half, false>);
+    } else if constexpr (kVariant == 1) {
+      entry = reinterpret_cast<void*>(
+          &decode_partial_kernel_pipelined<uint8_t, true>);
+    } else {
+      entry = reinterpret_cast<void*>(
+          &decode_partial_kernel_pipelined<uint8_t, false>);
+    }
+    return cudaFuncSetAttribute(entry,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                kPipeDynSmemBytes) == cudaSuccess;
   }();
   return ok;
 }
@@ -1263,9 +1331,10 @@ void sm70_longctx_decode_pipelined(
               "sm70_longctx expects H6/D256 GQA with a full KV-head split "
               "(TP1 Hkv4, TP2 Hkv2, TP4 Hkv1)");
   TORCH_CHECK((k_cache.scalar_type() == torch::kUInt8 ||
+               k_cache.scalar_type() == torch::kFloat8_e4m3fn ||
                k_cache.scalar_type() == torch::kHalf) &&
                   v_cache.scalar_type() == k_cache.scalar_type(),
-              "sm70_longctx expects an E5M2 byte or FP16 KV cache");
+              "sm70_longctx expects an E5M2 byte, E4M3 or FP16 KV cache");
   TORCH_CHECK(q.dtype() == torch::kHalf, "sm70_longctx expects fp16 queries");
   auto stream = at::cuda::getCurrentCUDAStream();
   dim3 grid((unsigned)heads_kv, (unsigned)max_splits, (unsigned)batch);
@@ -1274,11 +1343,25 @@ void sm70_longctx_decode_pipelined(
   const int max_blocks = page_table.numel() > 0 ? (int)page_table.size(1) : 0;
   const float scale_k = (float)(softmax_scale * k_scale);
   const float vscale = (float)v_scale;
-  if (k_cache.scalar_type() == torch::kUInt8) {
-    TORCH_CHECK(pipelined_smem_ready<uint8_t>(),
+  const bool is_e4m3 = k_cache.scalar_type() == torch::kFloat8_e4m3fn;
+  if (is_e4m3) {
+    TORCH_CHECK(pipelined_smem_ready<1>(),
                 "cannot raise the dynamic smem limit for the pipelined "
                 "decode kernel");
-    decode_partial_kernel_pipelined<uint8_t>
+    decode_partial_kernel_pipelined<uint8_t, true>
+        <<<grid, kThreads, kPipeDynSmemBytes, stream>>>(
+            reinterpret_cast<const __half*>(q.data_ptr()),
+            reinterpret_cast<const uint8_t*>(k_cache.data_ptr()),
+            reinterpret_cast<const uint8_t*>(v_cache.data_ptr()), page_ptr,
+            seq_lens.data_ptr<int>(), (int)max_splits,
+            (int)min_tokens_per_split, max_blocks, scale_k, vscale,
+            reinterpret_cast<__half*>(partial_o.data_ptr()),
+            partial_lse.data_ptr<float>());
+  } else if (k_cache.scalar_type() == torch::kUInt8) {
+    TORCH_CHECK(pipelined_smem_ready<0>(),
+                "cannot raise the dynamic smem limit for the pipelined "
+                "decode kernel");
+    decode_partial_kernel_pipelined<uint8_t, false>
         <<<grid, kThreads, kPipeDynSmemBytes, stream>>>(
             reinterpret_cast<const __half*>(q.data_ptr()),
             reinterpret_cast<const uint8_t*>(k_cache.data_ptr()),
@@ -1288,10 +1371,10 @@ void sm70_longctx_decode_pipelined(
             reinterpret_cast<__half*>(partial_o.data_ptr()),
             partial_lse.data_ptr<float>());
   } else {
-    TORCH_CHECK(pipelined_smem_ready<__half>(),
+    TORCH_CHECK(pipelined_smem_ready<2>(),
                 "cannot raise the dynamic smem limit for the pipelined "
                 "decode kernel");
-    decode_partial_kernel_pipelined<__half>
+    decode_partial_kernel_pipelined<__half, false>
         <<<grid, kThreads, kPipeDynSmemBytes, stream>>>(
             reinterpret_cast<const __half*>(q.data_ptr()),
             reinterpret_cast<const __half*>(k_cache.data_ptr()),
