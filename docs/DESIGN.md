@@ -11,17 +11,58 @@ work. Cutting it open by shortening one loop at a time:
 | QK math | 0.83 | 31% |
 | PV math | 1.06 | 40% |
 
-The memory path already runs at 683 GB/s against the 776 GB/s a plain `copy`
-gets on the same GPU, so the kernel is **instruction-bound, not bandwidth-bound**.
-That ruled out the obvious fixes and they stay ruled out:
+The first reading of that table was "instruction-bound, not bandwidth-bound",
+and it was wrong in a way worth keeping on the page. Two experiments settled it.
+
+Cutting the instruction count did nothing. The QK dot went from 128 scalar smem
+reads per row-tile to 32 vector reads, and PV from four strided reads per token
+to one 16-byte read, by giving lane `l` dims `[8l, 8l+8)` - the layout the loader
+already writes. Measured at 256k: 1.917 ms before, 1.917 ms after. Zero.
+
+The **fp16 KV cache moves twice the bytes in the same time**: 1.886 ms against
+1.246 ms for e5m2, at identical math. A kernel that does not slow down when you
+double its bytes is not bandwidth-bound, and one that does not speed up when you
+halve its instructions is not instruction-bound either. What both dtypes share
+is the number of *requests*: e5m2 reads 16 bytes per request and fp16 reads 32.
+
+So the kernel is **latency-bound on bytes in flight**. Two changes follow, and
+they are where all of the gain came from:
+
+1. **Batch the tile's loads** before consuming any of them, instead of
+   load-convert-store per iteration (`pipe_load_tile`): 1.917 -> 1.725 ms.
+2. **Two CTAs per SM** (`__launch_bounds__(kThreads, 2)`), so the hardware
+   interleaves one CTA's loads with the other's math and holds twice the bytes
+   in flight: 1.725 -> 1.246 ms.
+
+The software pipeline in `decode_partial_kernel_pipelined` (ten loader warps
+stream tile i+1 while six compute warps run tile i) reaches the same idea by
+hand and lands within 12% of the occupancy version. Which one wins depends on
+KV dtype, so both are kept:
+
+| at 256k, splits 80, lambda12 | e5m2 kvh=4 | e5m2 kvh=2 | fp16 kvh=4 |
+|---|---:|---:|---:|
+| before this work | 1.917 | 0.902 | 2.010 |
+| serial + batched loads | 1.725 | 0.891 | 1.981 |
+| warp-specialized pipeline | 1.414 | 0.719 | **1.631** |
+| two CTAs per SM | **1.246** | **0.628** | 1.886 |
+
+e5m2 is what long-context serving uses for capacity, and there occupancy wins by
+28%; fp16 is already at 658 GB/s of a 776 GB/s ceiling, so it has nothing left
+to win and the pipeline's extra overlap is what it can use.
+
+Earlier dead ends that stay dead, all re-checked against the same harness:
 
 - more splits: 2.51 ms at 20, 2.29 at 320, 2.50 at 1280 — plateau
 - page-table indirection: paged 2.680 vs dense 2.668 ms
 - concurrent kernels: two streams overlap 1.06x, no idle GPU
-- wider KV: fp16 moves 2x the bytes in 9% more time
 
-Hence the HFMA2 QK and per-tile half2 PV, both of which keep fp32 accumulation
-where it matters and leave greedy output byte-identical.
+The HFMA2 QK and per-tile half2 PV from the first round still stand: they keep
+fp32 accumulation where it matters and leave greedy output byte-identical. The
+vectorized smem reads were kept because they cost nothing, not because they pay.
+
+All three variants agree with an fp32 per-split reference to 1.6e-3 absolute on
+a signal of RMS 0.101 (`benchmarks/partial_check.py`), and serial, occ2 and
+pipelined agree with each other bit for bit (`benchmarks/attn_variants.py`).
 
 ## Where tensor cores would go
 
