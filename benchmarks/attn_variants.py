@@ -44,6 +44,9 @@ def main():
     ap.add_argument("--kv-heads", default="4,2", help="4 = TP1, 2 = TP2")
     ap.add_argument("--dtype", default="e5m2,fp16")
     ap.add_argument("--reps", type=int, default=20)
+    ap.add_argument("--warmup", type=int, default=40,
+                    help="iterations to run before timing; a V100 idles at "
+                         "135 MHz and only reaches 1530 under sustained load")
     args = ap.parse_args()
 
     if not sm70_cuda_decode_available():
@@ -68,7 +71,7 @@ def main():
                 for splits in [int(x) for x in args.splits.split(",")]:
                     row = {}
                     for variant in ("serial", "occ2", "pipelined"):
-                        for _ in range(3):
+                        for _ in range(args.warmup):
                             sm70_cuda_decode_partial(
                                 q, k, v, page_table, seq_lens, splits, 32,
                                 score_scale, 1.0, 1.0, variant=variant,

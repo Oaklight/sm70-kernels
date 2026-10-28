@@ -22,24 +22,31 @@ share an NVLink island**, and that is what changes a result.
 
 ## What transfers: a single-GPU kernel
 
-The accelerator is the same part with the same clock ceilings, so the shape of
-a kernel result transfers and the absolute value does not. Measured with the
-same binary, same driver, same 262144-token context, e5m2 KV, splits 80:
+Tested, and the first answer was wrong, so the method is on the record too.
 
-| variant | lambda12 kvh=2 | lambda2 kvh=2 | ratio |
-|---|---:|---:|---:|
-| serial + batched loads | 0.891 ms | 1.033 ms | 1.16x |
-| two CTAs per SM | **0.628 ms** | **0.728 ms** | 1.16x |
-| warp-specialized pipeline | 0.719 ms | 0.837 ms | 1.16x |
+The first cross-host comparison showed lambda2 16% slower than lambda12 on
+every variant, with the rankings preserved. That looked like a host effect. It
+was a **cold-clock artifact**: a V100 sits at 135 MHz and only reaches 1530 MHz
+under sustained load, and the harness warmed up for three iterations (~4 ms) -
+enough to warm one host that had already been running benchmarks and not
+enough for a host that had not.
 
-Every variant is 16% slower on lambda2 and the rankings are identical. So
-`occ2 > pipelined > serial` is a property of the kernel, while "0.63 ms" is a
-property of lambda12 on that afternoon. Report both or neither.
+With 40 warmup iterations, the same binary on the two hosts:
 
-The 16% is not explained by the board: the plausible causes are the neighbours
-(lambda2 had a job holding 7.4 GB on GPU 0 at 10%), the shared 2400 W chassis
-power budget, and host/PCIe affinity. If a number matters, re-measure it on the
-host that will run it rather than scaling.
+| at 256k, splits 80, e5m2 | lambda12 kvh=2 | lambda2 kvh=2 |
+|---|---:|---:|
+| serial + batched loads | 0.861 ms | 0.869 ms |
+| two CTAs per SM | **0.630 ms** | **0.628 ms** |
+| warp-specialized pipeline | 0.709 ms | 0.718 ms |
+
+Same part, same clock ceiling, same number, to within 0.3%. So a single-GPU
+kernel result transfers across the lab as long as the harness controls the
+clock. `attn_variants.py` now defaults to 40 warmup iterations for that reason;
+anything measured with a shorter warmup is a statement about the clock ramp.
+
+TP1 (4 kv heads, 320 CTAs, two waves of two CTAs per SM) is the noisy one:
+1.246 to 1.446 ms across runs where TP2 never moves. If a comparison matters,
+run TP1 several times and take the best, not the first.
 
 ## What does not transfer: anything with collectives
 
