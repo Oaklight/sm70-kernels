@@ -75,6 +75,7 @@ def _load_ops():
 def sm70_cuda_decode_partial(
     q, k_cache, v_cache, page_table, seq_lens,
     max_splits, min_tokens_per_split, softmax_scale, k_scale=1.0, v_scale=1.0,
+    variant="serial",
 ):
     """Run the CUDA split-KV partial, returning (partial_o, partial_lse).
 
@@ -83,6 +84,10 @@ def sm70_cuda_decode_partial(
     v_cache:    same shape/dtype as k_cache
     page_table: [batch, max_pages] int32, or an empty tensor for a dense cache
     seq_lens:   [batch] int32
+
+    variant:    "serial"    - all warps load, then six warps compute
+                "occ2"      - serial, two CTAs per SM so the SM overlaps them
+                "pipelined" - ten warps stream tile i+1 while six compute i
     """
     ext = _load_ops()
     if ext is None:
@@ -96,7 +101,12 @@ def sm70_cuda_decode_partial(
     )
     fp8 = k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     kv = (lambda t: t.view(torch.uint8)) if fp8 else (lambda t: t)
-    ext.sm70_longctx_decode(
+    entry = {
+        "serial": ext.sm70_longctx_decode,
+        "occ2": ext.sm70_longctx_decode_occ2,
+        "pipelined": ext.sm70_longctx_decode_pipelined,
+    }[variant]
+    entry(
         q.contiguous(), kv(k_cache).contiguous(), kv(v_cache).contiguous(),
         page_table.to(dtype=torch.int32).contiguous(),
         seq_lens.to(dtype=torch.int32).contiguous(),
