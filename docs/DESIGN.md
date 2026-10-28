@@ -122,3 +122,52 @@ Note that upstream's `block_M=16` decode uses tensor cores on a shape where 15 o
 16 rows are padding; the GEMV branch exists precisely because SM70's MMA may lose
 to plain FMA at q=1. That question is measurable here in an afternoon, and it is
 the first thing to settle before writing more TileLang decode code.
+
+## KV dtype: e5m2 was chosen for the kernel, not for accuracy
+
+The decode partial converts E5M2 to FP16 with a byte shift, which is exact
+because E5M2 and FP16 share a sign bit, a five-bit exponent and the same bias.
+E4M3 has a four-bit exponent with bias 7 and a three-bit mantissa, so it needs
+real conversion and the kernel used to refuse it. That refusal is why every
+measurement here is E5M2, and the reason was speed, not quality.
+
+Measured, one 32k prefix against an fp32 reference, same quantized bytes on
+both sides:
+
+| fmt | rel rms | max abs err | saturated |
+|---|---:|---:|---:|
+| fp16 | 0.03% | 9.1e-06 | 0% |
+| **e4m3** | **4.05%** | 1.2e-03 | 0% |
+| e5m2 | 7.68% | 2.1e-03 | 0% |
+
+and at 8x key magnitude, which is what a long context does to K:
+
+| fmt | rel rms | saturated |
+|---|---:|---:|
+| **e4m3** | **12.2%** | 0% |
+| e5m2 | 41.6% | 0% |
+
+Neither format saturates, so the range argument for E5M2 (448 against 57,344)
+does not bite on this data. **E4M3 is about twice as accurate at identical
+capacity.**
+
+`e4m3_to_fp16_16` now exists and is selected by passing the cache with its own
+dtype rather than viewed as bytes. The conversion is exact - the kernel's
+residual error against the reference is 0.00116 for E4M3 against 0.00115 for
+FP16 - so E4M3 costs nothing in conversion fidelity.
+
+It costs time:
+
+| at 256k, splits 80, TP2 | occ2 |
+|---|---:|
+| e5m2 KV | 0.727 ms |
+| e4m3 KV | **1.014 ms** (1.39x) |
+
+The CUDA intrinsic `__nv_cvt_fp8x2_to_halfraw2` is emulated on SM70 and is
+*slower* than the hand-rolled conversion (1.238 against 0.951 ms on the same
+shape), so the kernel uses the explicit version.
+
+Whether 1.39x of attention time is worth 2x of KV accuracy is a quality
+question this repo cannot answer: it needs a perplexity or task metric, not an
+attention RMS. What is now true is that E4M3 is not blocked by the kernel - it
+is a flag, and the price is known.

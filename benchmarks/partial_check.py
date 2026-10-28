@@ -66,24 +66,23 @@ def main():
     split_len = (args.context + args.splits - 1) // args.splits
     active = min(args.splits, max(1, (args.context + 32 - 1) // 32))
 
-    for kv_dtype in ("e5m2", "fp16"):
+    for kv_dtype in ("e5m2", "e4m3", "fp16"):
         if kv_dtype == "e5m2":
             kc = dense_k.to(torch.float8_e5m2)
             vc = dense_v.to(torch.float8_e5m2)
             kq, vq = kc, vc  # kernel dequantizes from the same bytes
+        elif kv_dtype == "e4m3":
+            kc = dense_k.to(torch.float8_e4m3fn)
+            vc = dense_v.to(torch.float8_e4m3fn)
+            kq, vq = kc, vc
         else:
+            kc, vc = dense_k, dense_v
             kq, vq = dense_k, dense_v
         page_table = torch.arange(
             args.context // PAGE + 1, dtype=torch.int32, device=dev
         ).unsqueeze(0)
-        paged_k = (
-            (dense_k.reshape(-1, PAGE, heads_kv, DIM) if kv_dtype == "fp16"
-             else dense_k.to(torch.float8_e5m2).reshape(-1, PAGE, heads_kv, DIM))
-        )
-        paged_v = (
-            (dense_v.reshape(-1, PAGE, heads_kv, DIM) if kv_dtype == "fp16"
-             else dense_v.to(torch.float8_e5m2).reshape(-1, PAGE, heads_kv, DIM))
-        )
+        paged_k = kc.reshape(-1, PAGE, heads_kv, DIM)
+        paged_v = vc.reshape(-1, PAGE, heads_kv, DIM)
         for variant in ("serial", "occ2", "pipelined"):
             o, lse = sm70_cuda_decode_partial(
                 q, paged_k, paged_v, page_table, seq_lens, args.splits, 32,
