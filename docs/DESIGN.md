@@ -156,18 +156,38 @@ dtype rather than viewed as bytes. The conversion is exact - the kernel's
 residual error against the reference is 0.00116 for E4M3 against 0.00115 for
 FP16 - so E4M3 costs nothing in conversion fidelity.
 
-It costs time:
+### It cost time until the conversion was fixed
 
-| at 256k, splits 80, TP2 | occ2 |
-|---|---:|
-| e5m2 KV | 0.727 ms |
-| e4m3 KV | **1.014 ms** (1.39x) |
+The first version of `e4m3_to_fp16_16` was branchy per-byte bit manipulation and
+cost 41% more than E5M2. That was a property of the code, not of the format:
 
-The CUDA intrinsic `__nv_cvt_fp8x2_to_halfraw2` is emulated on SM70 and is
-*slower* than the hand-rolled conversion (1.238 against 0.951 ms on the same
-shape), so the kernel uses the explicit version.
+| at 256k, splits 80, TP2 | branchy | PRMT (shipped) |
+|---|---:|---:|
+| e5m2 KV | 0.727 ms | 0.629 ms |
+| e4m3 KV | 1.014 ms | **0.635 ms** |
 
-Whether 1.39x of attention time is worth 2x of KV accuracy is a quality
-question this repo cannot answer: it needs a perplexity or task metric, not an
-attention RMS. What is now true is that E4M3 is not blocked by the kernel - it
-is a flag, and the price is known.
+E4M3 KV now costs the same as E5M2 to convert - within 1%, which is noise - and
+it is twice as accurate. The rewrite is 32 SASS instructions per 16-byte vector
+against 480 for the branchy form and 752 for `__nv_cvt_fp8x2_to_halfraw2`,
+which is emulated on SM70 and was measured slower than both.
+
+Two things make it that cheap:
+
+- The bias correction is a **multiply by 256, not an add**. Assembling
+  `s<<15 | e<<10 | m<<7` is right for normals, and for `e == 0` it yields the
+  FP16 subnormal `m<<7 = m*2^-17` where E4M3 means `m*2^-9`; one `HMUL2` fixes
+  both cases and covers two values per instruction. Adding `0x2000` per half is
+  wrong for all 18 subnormal encodings.
+- E5M2 needs no arithmetic at all: it is the high byte of each half, so two
+  `PRMT`s convert four values.
+
+The only E4M3 inputs not reproduced are `0x7F` and `0xFF`, which come out as
++-480 rather than NaN. A saturating quantizer cannot produce them.
+
+### So the KV dtype is a free choice
+
+Equal speed, twice the accuracy, same capacity: **E4M3 is the better KV format
+on this hardware**, and the reason every earlier measurement used E5M2 was that
+the kernel refused E4M3 rather than that E4M3 was worse. What it still cannot
+settle is whether the accuracy matters: that needs a perplexity or task metric,
+not an attention RMS.

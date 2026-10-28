@@ -46,20 +46,19 @@ constexpr int kSmemBytes = 2 * kSmemKV * sizeof(__half) +
                            kGroup * kBlockN * sizeof(float) +
                            kGroup * kBlockN * sizeof(__half);
 
+// E5M2 -> FP16 is exact as the high byte of each half: the two formats share a
+// sign bit, a five-bit exponent and the same bias, so the conversion is two
+// PRMTs per four values (0.5 instructions/value) where the shift-and-mask form
+// costs 2.5. NaN and infinity come out right, because the exponent field is
+// copied rather than recomputed.
 __device__ __forceinline__ void e5m2_to_fp16_16(const uint4 raw, half* dst) {
-  // E5M2 shares sign/exponent bit positions with FP16: each byte shifted left
-  // by 8 is an exact value conversion, and the 16 output halves must keep the
-  // same dim order as the 16 input bytes. Each 32-bit input word b = [b0..b3]
-  // produces one uint32 pair [fp16(b0), fp16(b1)] and one [fp16(b2), fp16(b3)];
-  // the pairs go to consecutive uint32 slots so dim order is preserved.
   const uint32_t* r = reinterpret_cast<const uint32_t*>(&raw);
   uint32_t out[8];
 #pragma unroll
   for (int w = 0; w < 4; ++w) {
     const uint32_t b = r[w];
-    out[2 * w] = (b & 0x000000ffu) << 8 | ((b >> 8) & 0x000000ffu) << 24;
-    out[2 * w + 1] = ((b >> 16) & 0x000000ffu) << 8 |
-                     ((b >> 24) & 0x000000ffu) << 24;
+    out[2 * w] = __byte_perm(b, 0u, 0x1404);      // [0, b0, 0, b1]
+    out[2 * w + 1] = __byte_perm(b, 0u, 0x3626);  // [0, b2, 0, b3]
   }
   *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(out);
   *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(out + 4);
@@ -72,39 +71,43 @@ __device__ __forceinline__ void e5m2_to_fp16_16(const uint4 raw, half* dst) {
 // mantissa slide (m << 7); E4M3 subnormals have no implicit leading one and
 // have to be renormalized into FP16, which is normal for them because E4M3's
 // smallest subnormal is 2^-9 and FP16's is 2^-24.
-__device__ __forceinline__ unsigned short e4m3_byte_to_half_ref(const unsigned b) {
-  const unsigned sign = (b & 0x80u) << 8;
-  const int exp = (b >> 3) & 0xFu;
-  const int mant = b & 0x7u;
-  if (exp == 0) {
-    if (mant == 0) {
-      return (unsigned short)sign;  // +-0
-    }
-    const int lead = 31 - __clz((unsigned)mant);
-    const int e16 = 15 - 9 + lead;
-    const int m16 = (mant << (10 - lead)) & 0x3FF;
-    return (unsigned short)(sign | (e16 << 10) | m16);
-  }
-  if (exp == 0xF && mant == 0x7) {
-    return (unsigned short)(sign | 0x7E00u);  // NaN
-  }
-  return (unsigned short)(sign | ((exp + 8) << 10) | (mant << 7));
+// E4M3 -> FP16, four values at a time, 32 SASS instructions per 16-byte vector
+// against 480 for the branchy form and 752 for __nv_cvt_fp8x2_to_halfraw2,
+// which is emulated on SM70. Exact for all 254 finite E4M3 codes.
+//
+// The bias correction has to be a multiply, not an add. Assembling
+// s<<15 | e<<10 | m<<7 gives the right answer for normals, and for e == 0 it
+// gives the FP16 subnormal m<<7 = m*2^-17 where E4M3 means m*2^-9; one HMUL2 by
+// 256 restores both cases, and it covers two values per instruction. Adding
+// 0x2000 per half instead is wrong for every one of the 18 subnormal encodings.
+//
+// The only inputs it does not reproduce are 0x7F and 0xFF, which come out as
+// +-480 rather than NaN. A saturating quantizer cannot produce them, so a KV
+// cache cannot contain them; the cost of fixing it is 1.8x on this path.
+__device__ __forceinline__ uint2 cvt4_e4m3(const unsigned w) {
+  const unsigned lo = (w << 7) & 0x80808080u;              // mantissa bit 0
+  const unsigned hi = (((w & 0x7F7F7F7Fu) >> 1) & 0x3F3F3F3Fu) |
+                      (w & 0x80808080u);                    // e at 5:2, sign at 7
+  union {
+    unsigned u;
+    __half2 h;
+  } c0, c1;
+  const __half2 k256 = __float2half2_rn(256.0f);
+  c0.u = __byte_perm(lo, hi, 0x5140);  // lo.b0, hi.b0, lo.b1, hi.b1
+  c1.u = __byte_perm(lo, hi, 0x7362);  // lo.b2, hi.b2, lo.b3, hi.b3
+  c0.h = __hmul2(c0.h, k256);
+  c1.h = __hmul2(c1.h, k256);
+  return make_uint2(c0.u, c1.u);
 }
 
-// The CUDA intrinsic (__nv_cvt_fp8x2_to_halfraw2) is emulated on SM70 and
-// measured 30% slower than this hand-rolled version at 256k (1.238 against
-// 0.951 ms), so the explicit form is what the kernel uses. `_ref` is kept as
-// the readable statement of the encoding that the fast path must match.
 __device__ __forceinline__ void e4m3_to_fp16_16(const uint4 raw, half* dst) {
   const uint32_t* r = reinterpret_cast<const uint32_t*>(&raw);
   uint32_t out[8];
 #pragma unroll
   for (int w = 0; w < 4; ++w) {
-    const uint32_t b = r[w];
-    out[2 * w] = (uint32_t)e4m3_byte_to_half_ref(b & 0xFFu) |
-                 ((uint32_t)e4m3_byte_to_half_ref((b >> 8) & 0xFFu) << 16);
-    out[2 * w + 1] = (uint32_t)e4m3_byte_to_half_ref((b >> 16) & 0xFFu) |
-                     ((uint32_t)e4m3_byte_to_half_ref((b >> 24) & 0xFFu) << 16);
+    const uint2 p = cvt4_e4m3(r[w]);
+    out[2 * w] = p.x;
+    out[2 * w + 1] = p.y;
   }
   *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(out);
   *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(out + 4);
