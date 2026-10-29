@@ -1,16 +1,18 @@
-"""Differential cost of the decode kernel's compute phase.
+"""Differential cost of the decode kernel's compute phase, and of its two terms.
 
 Runs one arm per invocation and patches a temporary copy of the package, so the
 tree is never modified:
 
     python benchmarks/phase_differential.py --arm full
     python benchmarks/phase_differential.py --arm nocompute
+    python benchmarks/phase_differential.py --arm noqk
+    python benchmarks/phase_differential.py --arm nopv
 
 `nocompute` removes `decode_tile_compute` from `decode_partial_kernel` and
 replaces it with a two-`LDS` sink, which keeps every load, E5M2 conversion, smem
-store and barrier while dropping the math. The difference is what the compute
-phase costs the kernel - the number `docs/DESIGN.md` quotes as 0.283 ms of 0.620
-at e5m2/TP2/256k.
+store and barrier while dropping the math. `noqk` and `nopv` remove one term
+each, which is how the 0.287 ms splits: QK 0.135 ms, PV 0.133 ms at
+e5m2/TP2/256k. The difference between an arm and `full` is what that term costs.
 
 Why not `clock64` counters: bracketing the phases pushed the kernel's stack frame
 from 240 to 288 bytes, because it holds 64 registers under
@@ -64,39 +66,111 @@ FIN_NEW = """  // ---- Finalize partial output for this partition ----
   }
   if (is_compute_warp) {"""
 
+# The two terms of the compute phase, for the noqk / nopv arms.
+QK_OLD = """    const uint4* qv = reinterpret_cast<const uint4*>(qs + r * kDim);
+    const uint4* kv = reinterpret_cast<const uint4*>(ks + lane * kKVStride);
+    __half2 hacc0 = __float2half2_rn(0.f);
+    __half2 hacc1 = hacc0, hacc2 = hacc0, hacc3 = hacc0;
+#pragma unroll
+    for (int h = 0; h < kDim / 8; ++h) {
+      const uint4 qa = qv[h];
+      const uint4 ka = kv[h];
+      const __half2* qh = reinterpret_cast<const __half2*>(&qa);
+      const __half2* kh2 = reinterpret_cast<const __half2*>(&ka);
+      hacc0 = __hfma2(qh[0], kh2[0], hacc0);
+      hacc1 = __hfma2(qh[1], kh2[1], hacc1);
+      hacc2 = __hfma2(qh[2], kh2[2], hacc2);
+      hacc3 = __hfma2(qh[3], kh2[3], hacc3);
+    }
+    const __half2 ssum = __hadd2(__hadd2(hacc0, hacc1), __hadd2(hacc2, hacc3));
+    const float acc = __half2float(ssum.x) + __half2float(ssum.y);"""
+
+QK_NEW = """    const float acc = 0.f;  // QK removed for the partition"""
+
+PV_OLD = """#pragma unroll
+  for (int n = 0; n < kBlockN; ++n) {
+    const float pn = __half2float(probs[r * kBlockN + n]);
+    if (pn == 0.f) {
+      continue;
+    }
+    const __half2 p2 = __float2half2_rn(pn);
+    const uint4 va =
+        *reinterpret_cast<const uint4*>(vs + n * kKVStride + 8 * lane);
+    const __half2* vh = reinterpret_cast<const __half2*>(&va);
+#pragma unroll
+    for (int j = 0; j < kPairsPerLane; ++j) {
+      tacc[j] = __hfma2(p2, vh[j], tacc[j]);
+    }
+  }"""
+
+PV_NEW = """  // PV token loop removed for the partition"""
+
+CALL_OLD = """    // ---- QK / softmax / PV for one 32-token tile ----
+    if (is_compute_warp) {"""
+
+CALL_NEW = """    // ---- QK / softmax / PV for one 32-token tile ----
+    if (tid == 0) {
+      dbg_sink += __half2float(ks[tile & 31]) + __half2float(vs[tile & 31]);
+    }
+    if (is_compute_warp) {"""
+
 
 def _prepare(arm):
-    """Copy the package to a temp dir and, for the nocompute arm, strip the math."""
+    """Copy the package to a temp dir and strip the requested term.
+
+    full       - the shipped kernel
+    nocompute  - no QK, no softmax, no PV
+    noqk       - the QK dot is a constant; softmax and PV still run on it
+    nopv       - the PV token loop is gone; QK and softmax still run
+    """
     root = tempfile.mkdtemp(prefix="sm70phase_")
     shutil.copytree(os.path.join(ROOT, "sm70_kernels"),
                     os.path.join(root, "sm70_kernels"),
                     ignore=shutil.ignore_patterns("__pycache__", "*.so", "*.o"))
+    if arm == "full":
+        return root
+
+    path = os.path.join(root, "sm70_kernels", "longctx_decode", "csrc",
+                        "sm70_longctx_decode.cu")
+    src = open(path).read()
+
     if arm == "nocompute":
-        path = os.path.join(root, "sm70_kernels", "longctx_decode", "csrc",
-                            "sm70_longctx_decode.cu")
-        src = open(path).read()
-        # The compute block is unique to decode_partial_kernel. The declaration
-        # and the sink consumer are not - the other kernels share that boilerplate
-        # - so both are applied at their first occurrence, which is this kernel
-        # because it is defined before them.
+        # The compute block is unique to decode_partial_kernel, and it carries
+        # its own sink, so this arm needs no CALL_NEW.
         n = src.count(COMPUTE_OLD)
         assert n == 1, "compute block matched %d times" % n
         src = src.replace(COMPUTE_OLD, COMPUTE_NEW)
-        for old, new, what in (
-            (DECL_OLD, DECL_NEW, "sink declaration"),
-            (FIN_OLD, FIN_NEW, "sink consumer"),
-        ):
-            n = src.count(old)
-            assert n >= 1, "%s not found" % what
-            i = src.index(old)
-            src = src[:i] + new + src[i + len(old):]
-        open(path, "w").write(src)
+    elif arm == "noqk":
+        # qk_softmax_tile carries a copy of this block; decode_tile_compute is
+        # defined first, so the first occurrence is the one to strip.
+        assert QK_OLD in src, "QK block not found"
+        i = src.index(QK_OLD)
+        src = src[:i] + QK_NEW + src[i + len(QK_OLD):]
+    else:  # nopv
+        n = src.count(PV_OLD)
+        assert n == 1, "PV loop matched %d times" % n
+        src = src.replace(PV_OLD, PV_NEW)
+
+    edits = [(DECL_OLD, DECL_NEW, "sink declaration"),
+             (FIN_OLD, FIN_NEW, "sink consumer")]
+    if arm != "nocompute":
+        # With a term gone its buffer can go dead, and ptxas is then entitled to
+        # delete the smem stores the load phase just wrote - which would quietly
+        # remove the memory traffic this arm is meant to hold fixed.
+        edits.append((CALL_OLD, CALL_NEW, "per-tile sink"))
+    for old, new, what in edits:
+        n = src.count(old)
+        assert n >= 1, "%s not found" % what
+        i = src.index(old)
+        src = src[:i] + new + src[i + len(old):]
+    open(path, "w").write(src)
     return root
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=("full", "nocompute"), default="full")
+    ap.add_argument("--arm", choices=("full", "nocompute", "noqk", "nopv"),
+                    default="full")
     ap.add_argument("--contexts", default="262144")
     ap.add_argument("--kv-heads", default="2,4", help="2 = TP2, 4 = TP1")
     ap.add_argument("--dtype", default="e5m2,fp16")

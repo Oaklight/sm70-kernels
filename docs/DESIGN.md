@@ -202,12 +202,51 @@ too - pv2 pays a third barrier per tile and drops the PV loads from `LDS.128` to
 its runtime and which is memory-bound, comes out **slower**. That is the control
 which says the win is real but bounded.
 
-So the exposed compute is not in PV. QK and the softmax shuffle chain are what is
-left, and QK is the one that can be spread over warps without changing shape: two
-warps over 128 dims each, one barrier, then an fp32 add of the two halves. That
-does change the summation order - each half accumulates 128 dims in fp16 and the
-halves are added in fp32 - so it stops being bitwise identical and has to be
-checked against the fp32 reference in `benchmarks/partial_check.py` instead.
+So PV is not *instruction*-bound. What used to follow here - "the exposed compute
+is not in PV" - was the wrong inference from those 2%, and the next section
+measures the two terms directly and finds PV is half of it. QK is the one that
+can be spread over warps without changing shape: two warps over 128 dims each,
+one barrier, then an fp32 add of the two halves. That does change the summation
+order - each half accumulates 128 dims in fp16 and the halves are added in fp32 -
+so it stops being bitwise identical and has to be checked against the fp32
+reference in `benchmarks/partial_check.py` instead.
+
+### Correction: that table says PV is not instruction-bound, not that it is small
+
+The paragraph above reads the 2% as evidence that PV is a small part of the
+compute. That does not follow, and the next measurement says so.
+
+pv2 halves PV's *instruction count* - two warps, 4 dims a lane instead of 8 - but
+it does not shorten PV's dependency chain, which is 32 tokens long either way.
+A latency-bound loop does not care how many lanes feed it. So 2% says PV is not
+instruction-bound. Removing PV outright answers the other question, by taking
+`for (n = 0; n < kBlockN; ++n)` out of `decode_tile_compute` with a per-tile sink
+so `vs` cannot go dead (`--arm nopv`), and doing the same to the QK dot
+(`--arm noqk`):
+
+| arm at e5m2/TP2/256k | ms | delta |
+|---|---:|---:|
+| full | 0.623 | |
+| no QK | 0.488 | -0.135, 21.7% |
+| no PV | 0.490 | -0.133, 21.3% |
+| neither | 0.333 | -0.290, 46.5% |
+
+**QK and PV cost the same**, 0.135 and 0.133 ms, about a fifth of the kernel
+each. Their sum is 8% short of removing both (0.268 against 0.290); the
+difference is interaction, mostly the second barrier that each single-term arm
+still keeps. So the exposed compute is half QK and half PV, both latency-bound on
+a 32-long chain, and both worth about 11% of the kernel if that chain can be
+halved.
+
+The chain is what to attack, and neither split tried so far shortens it: pv2
+halved the lanes' work, not the 32 tokens. Two ways that do shorten it, both
+changing the summation order and both therefore needing `benchmarks/partial_check.py`
+rather than the bitwise check:
+
+- **PV over the token axis**: two warps, 16 tokens each, one fp32 add of the two
+  partial accumulators per dim. Exactly halves the chain.
+- **QK over the dim axis**: two warps, 128 dims each, one fp32 add of the two
+  halves. Halves the chain and changes the fp16 accumulation grouping too.
 
 ### Two ways to mis-measure this, both hit on the way
 
