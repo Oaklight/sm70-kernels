@@ -270,6 +270,128 @@ __device__ __forceinline__ void decode_tile_compute(
   }
 }
 
+
+// ---- PV across two warps per row -------------------------------------------
+// Warp pair (2r, 2r+1) owns row r. The even warp keeps QK, the online softmax
+// and the m/l state, because those are lane==token and have no spare dimension;
+// both warps then run PV over half the row each, lane l owning dims
+// [half*128 + 4l, +4). Disjoint dims mean no reduction and no change to any
+// lane's accumulation order.
+constexpr int kPv2DimsPerLane = kDim / (2 * 32);   // 4
+constexpr int kPv2Half = kDim / 2;                 // 128
+
+__device__ __forceinline__ void qk_softmax_tile(
+    const int r, const int tile_tokens, const __half* __restrict__ ks,
+    const __half* __restrict__ vs, const __half* __restrict__ qs,
+    float* __restrict__ scores, __half* __restrict__ probs, float& m_row,
+    float& l_row, float* __restrict__ alpha_s, const float scale_log2) {
+  const int lane = threadIdx.x & 31;
+
+  // ---- QK: lane == token, the whole 256-dim dot in four fp16 accumulators ----
+  {
+    const uint4* qv = reinterpret_cast<const uint4*>(qs + r * kDim);
+    const uint4* kv = reinterpret_cast<const uint4*>(ks + lane * kKVStride);
+    __half2 hacc0 = __float2half2_rn(0.f);
+    __half2 hacc1 = hacc0, hacc2 = hacc0, hacc3 = hacc0;
+#pragma unroll
+    for (int h = 0; h < kDim / 8; ++h) {
+      const uint4 qa = qv[h];
+      const uint4 ka = kv[h];
+      const __half2* qh = reinterpret_cast<const __half2*>(&qa);
+      const __half2* kh2 = reinterpret_cast<const __half2*>(&ka);
+      hacc0 = __hfma2(qh[0], kh2[0], hacc0);
+      hacc1 = __hfma2(qh[1], kh2[1], hacc1);
+      hacc2 = __hfma2(qh[2], kh2[2], hacc2);
+      hacc3 = __hfma2(qh[3], kh2[3], hacc3);
+    }
+    const __half2 ssum = __hadd2(__hadd2(hacc0, hacc1), __hadd2(hacc2, hacc3));
+    const float acc = __half2float(ssum.x) + __half2float(ssum.y);
+    if (lane < tile_tokens) {
+      scores[r * kBlockN + lane] = acc;
+    }
+  }
+  __syncwarp();
+
+  // ---- online softmax ----
+  float loc_max = -1.0e30f;
+  if (lane < tile_tokens) {
+    loc_max = scores[r * kBlockN + lane];
+  }
+#pragma unroll
+  for (int off = 16; off; off >>= 1) {
+    loc_max = fmaxf(loc_max, __shfl_xor_sync(0xffffffffu, loc_max, off));
+  }
+  const float m_new = fmaxf(m_row, loc_max);
+  const float alpha = exp2f((m_row - m_new) * scale_log2);
+  m_row = m_new;
+  l_row *= alpha;
+  float p = 0.f;
+  if (lane < tile_tokens) {
+    p = exp2f((scores[r * kBlockN + lane] - m_new) * scale_log2);
+  }
+  probs[r * kBlockN + lane] = __float2half(p);
+  float loc_sum = p;
+#pragma unroll
+  for (int off = 16; off; off >>= 1) {
+    loc_sum += __shfl_xor_sync(0xffffffffu, loc_sum, off);
+  }
+  l_row += loc_sum;
+  __syncwarp();
+  alpha_s[r] = alpha;
+}
+
+__device__ __forceinline__ void pv_half_tile(
+    const int r, const int half, const __half* __restrict__ vs,
+    const __half* __restrict__ probs, float (&o_acc)[kAccPerLane],
+    const float alpha) {
+  const int lane = threadIdx.x & 31;
+  if (alpha != 1.f) {
+#pragma unroll
+    for (int j = 0; j < kPv2DimsPerLane; ++j) {
+      o_acc[j] *= alpha;
+    }
+  }
+  __half2 tacc[kPv2DimsPerLane / 2];
+#pragma unroll
+  for (int j = 0; j < kPv2DimsPerLane / 2; ++j) {
+    tacc[j] = __float2half2_rn(0.f);
+  }
+  const int d0 = half * kPv2Half + kPv2DimsPerLane * lane;
+#pragma unroll
+  for (int n = 0; n < kBlockN; ++n) {
+    const float pn = __half2float(probs[r * kBlockN + n]);
+    if (pn == 0.f) {
+      continue;
+    }
+    const __half2 p2 = __float2half2_rn(pn);
+    const uint2 va = *reinterpret_cast<const uint2*>(vs + n * kKVStride + d0);
+    const __half2* vh = reinterpret_cast<const __half2*>(&va);
+#pragma unroll
+    for (int j = 0; j < kPv2DimsPerLane / 2; ++j) {
+      tacc[j] = __hfma2(p2, vh[j], tacc[j]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < kPv2DimsPerLane / 2; ++j) {
+    o_acc[2 * j] += __low2float(tacc[j]);
+    o_acc[2 * j + 1] += __high2float(tacc[j]);
+  }
+}
+
+__device__ __forceinline__ void store_partial_row_pv2(
+    __half* __restrict__ o_row, const float (&o_acc)[kAccPerLane], const int half,
+    const float inv_l, const float kv_scale) {
+  const int lane = threadIdx.x & 31;
+  __half2 out[kPv2DimsPerLane / 2];
+#pragma unroll
+  for (int j = 0; j < kPv2DimsPerLane / 2; ++j) {
+    out[j] = __floats2half2_rn(o_acc[2 * j] * inv_l * kv_scale,
+                               o_acc[2 * j + 1] * inv_l * kv_scale);
+  }
+  *reinterpret_cast<uint2*>(o_row + half * kPv2Half + kPv2DimsPerLane * lane) =
+      *reinterpret_cast<const uint2*>(out);
+}
+
 // Write one normalized query row: lane l owns dims [8l, 8l+8), so the row goes
 // out as a single 16-byte store per lane.
 __device__ __forceinline__ void store_partial_row(
@@ -824,6 +946,137 @@ decode_partial_kernel_regpipe(const __half* __restrict__ q,
       partial_lse[((int64_t)seq_id * max_splits + split_id) * heads_total +
                   kv_head * kGroup + r] = lse;
     }
+  }
+}
+
+// PV across two warps per row: twelve compute warps instead of six, so the SM
+// has more eligible warps when the compute phase is latency-bound. Costs a third
+// barrier per tile (QK+softmax, then PV) and two floats of shared state per row.
+template <typename KV, bool kE4M3>
+__global__ void __launch_bounds__(kThreads, 2)
+decode_partial_kernel_pv2(const __half* __restrict__ q,
+                          const KV* __restrict__ k_cache,
+                          const KV* __restrict__ v_cache,
+                          const int* __restrict__ page_table,
+                          const int* __restrict__ seq_lens, const int max_splits,
+                          const int min_tokens_per_split, const int max_blocks,
+                          const float score_scale, const float kv_scale,
+                          __half* __restrict__ partial_o,
+                          float* __restrict__ partial_lse) {
+  const int kv_head = blockIdx.x;
+  const int kv_heads = gridDim.x;
+  const int kv_stride = kDim * kv_heads;
+  const int heads_total = kGroup * kv_heads;
+  const int split_id = blockIdx.y;
+  const int seq_id = blockIdx.z;
+
+  __shared__ __half ks[kSmemKV];
+  __shared__ __half vs[kSmemKV];
+  __shared__ __half qs[kGroup * kDim];
+  __shared__ float scores[kGroup * kBlockN];
+  __shared__ __half probs[kGroup * kBlockN];
+  __shared__ float alpha_s[kGroup];
+  __shared__ float inv_s[kGroup];
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const bool is_compute_warp = warp < 2 * kGroup;
+  const int row = warp >> 1;
+  const int half = warp & 1;
+
+  const int context = seq_lens[seq_id];
+  const int active_splits =
+      min(max_splits, max(1, (context + min_tokens_per_split - 1) /
+                                 min_tokens_per_split));
+  if (split_id >= active_splits || context <= 0) {
+    return;
+  }
+  const int split_len = (context + active_splits - 1) / active_splits;
+  const int split_begin = split_id * split_len;
+  const int split_end = min(context, split_begin + split_len);
+  if (split_begin >= split_end) {
+    if (is_compute_warp) {
+      __half* o_row =
+          partial_o +
+          (((int64_t)seq_id * max_splits + split_id) * heads_total +
+           kv_head * kGroup + row) *
+              kDim;
+      for (int d = half * kPv2Half + lane; d < (half + 1) * kPv2Half; d += 32) {
+        o_row[d] = __float2half(0.f);
+      }
+      if (half == 0 && lane == 0) {
+        partial_lse[((int64_t)seq_id * max_splits + split_id) * heads_total +
+                    kv_head * kGroup + row] = -1.0e30f;
+      }
+    }
+    return;
+  }
+  const float scale_log2 = score_scale * kLog2E;
+
+  for (int i = tid; i < kGroup * kDim; i += kThreads) {
+    const int r = i / kDim;
+    const int d = i % kDim;
+    qs[r * kDim + d] = q[(kv_head * kGroup + r) * kDim + d];
+  }
+
+  float m_row[kGroup];
+  float l_row[kGroup];
+  float o_acc[kGroup][kAccPerLane];
+#pragma unroll
+  for (int r = 0; r < kGroup; ++r) {
+    m_row[r] = -1.0e30f;
+    l_row[r] = 0.f;
+  }
+  if (is_compute_warp) {
+#pragma unroll
+    for (int j = 0; j < kAccPerLane; ++j) {
+      o_acc[row][j] = 0.f;
+    }
+  }
+  __syncthreads();
+
+  const int num_tiles = (split_end - split_begin + kBlockN - 1) / kBlockN;
+  for (int tile = 0; tile < num_tiles; ++tile) {
+    const int tile_begin = split_begin + tile * kBlockN;
+    const int tile_tokens = min(kBlockN, split_end - tile_begin);
+
+    pipe_load_tile<KV, kThreads, (2 * kPipeVecPerTensor + kThreads - 1) / kThreads, kE4M3>(
+        k_cache, v_cache, page_table, seq_id, kv_head, kv_stride, max_blocks,
+        tile_begin, split_end, tid, ks, vs);
+    __syncthreads();
+
+    if (is_compute_warp && half == 0) {
+      qk_softmax_tile(row, tile_tokens, ks, vs, qs, scores, probs,
+                      m_row[row], l_row[row], alpha_s, scale_log2);
+    }
+    __syncthreads();
+
+    if (is_compute_warp) {
+      pv_half_tile(row, half, vs, probs, o_acc[row], alpha_s[row]);
+    }
+    __syncthreads();
+  }
+
+  // Publish normalization and LSE from the even warp, then both halves store.
+  if (is_compute_warp && half == 0) {
+    const float inv_l = l_row[row] > 0.f ? 1.f / l_row[row] : 0.f;
+    inv_s[row] = inv_l;
+    if (lane == 0) {
+      const float lse =
+          l_row[row] > 0.f ? __log2f(l_row[row]) + m_row[row] * scale_log2
+                           : -1.0e30f;
+      partial_lse[((int64_t)seq_id * max_splits + split_id) * heads_total +
+                  kv_head * kGroup + row] = lse;
+    }
+  }
+  __syncthreads();
+  if (is_compute_warp) {
+    __half* o_row = partial_o +
+                    (((int64_t)seq_id * max_splits + split_id) * heads_total +
+                     kv_head * kGroup + row) *
+                        kDim;
+    store_partial_row_pv2(o_row, o_acc[row], half, inv_s[row], kv_scale);
   }
 }
 
@@ -1463,6 +1716,38 @@ inline void dispatch_regpipe(const DecodeArgs& a, cudaStream_t stream,
   }
 }
 
+template <typename KV, bool kE4M3>
+inline void launch_pv2(const DecodeArgs& a, cudaStream_t stream,
+                       const torch::Tensor& q, const torch::Tensor& k_cache,
+                       const torch::Tensor& v_cache,
+                       const torch::Tensor& seq_lens,
+                       torch::Tensor& partial_o, torch::Tensor& partial_lse) {
+  decode_partial_kernel_pv2<KV, kE4M3><<<a.grid, kThreads, 0, stream>>>(
+      reinterpret_cast<const __half*>(q.data_ptr()),
+      reinterpret_cast<const KV*>(k_cache.data_ptr()),
+      reinterpret_cast<const KV*>(v_cache.data_ptr()), a.page_ptr,
+      seq_lens.data_ptr<int>(), a.max_splits, a.min_tokens, a.max_blocks,
+      a.scale_k, a.vscale, reinterpret_cast<__half*>(partial_o.data_ptr()),
+      partial_lse.data_ptr<float>());
+}
+
+inline void dispatch_pv2(const DecodeArgs& a, cudaStream_t stream,
+                         const torch::Tensor& q, const torch::Tensor& k_cache,
+                         const torch::Tensor& v_cache,
+                         const torch::Tensor& seq_lens,
+                         torch::Tensor& partial_o, torch::Tensor& partial_lse) {
+  if (a.e4m3) {
+    launch_pv2<uint8_t, true>(a, stream, q, k_cache, v_cache, seq_lens,
+                              partial_o, partial_lse);
+  } else if (a.byte_cache) {
+    launch_pv2<uint8_t, false>(a, stream, q, k_cache, v_cache, seq_lens,
+                               partial_o, partial_lse);
+  } else {
+    launch_pv2<__half, false>(a, stream, q, k_cache, v_cache, seq_lens,
+                              partial_o, partial_lse);
+  }
+}
+
 // Dynamic smem above 48 KB needs the opt-in attribute set once per entry
 // point; V100 allows up to 96 KB with 1 KB reserved.
 // One int rather than <type, bool>: TORCH_CHECK is a macro and the comma in a
@@ -1614,6 +1899,22 @@ void sm70_longctx_decode_regpipe(torch::Tensor q, torch::Tensor k_cache,
   auto stream = at::cuda::getCurrentCUDAStream();
   dispatch_regpipe(a, stream, q, k_cache, v_cache, seq_lens, partial_o,
                    partial_lse);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// PV across two warps per query row: twelve compute warps instead of six.
+void sm70_longctx_decode_pv2(torch::Tensor q, torch::Tensor k_cache,
+                             torch::Tensor v_cache, torch::Tensor page_table,
+                             torch::Tensor seq_lens, int64_t max_splits,
+                             int64_t min_tokens_per_split, double softmax_scale,
+                             double k_scale, double v_scale,
+                             torch::Tensor partial_o, torch::Tensor partial_lse) {
+  c10::cuda::CUDAGuard guard(q.device());
+  const DecodeArgs a =
+      decode_args(q, k_cache, v_cache, page_table, max_splits,
+                  min_tokens_per_split, softmax_scale, k_scale, v_scale);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dispatch_pv2(a, stream, q, k_cache, v_cache, seq_lens, partial_o, partial_lse);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1769,6 +2070,8 @@ void sm70_qsa_prefill(torch::Tensor q, torch::Tensor k_cache,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sm70_longctx_decode_occ2", &sm70_longctx_decode_occ2,
         "split-KV decode with two CTAs resident per SM");
+  m.def("sm70_longctx_decode_pv2", &sm70_longctx_decode_pv2,
+        "split-KV decode with PV split across two warps per row");
   m.def("sm70_longctx_decode_regpipe", &sm70_longctx_decode_regpipe,
         "split-KV decode: register-staged pipeline, two CTAs per SM");
   m.def("sm70_longctx_decode", &sm70_longctx_decode,

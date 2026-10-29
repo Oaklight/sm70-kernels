@@ -179,6 +179,36 @@ reduction at all (lane `l` owns dims `[8l, 8l+8)`, so two warps per row can own
 half each); QK needs the 256-dim dot split with a cross-warp add instead. That
 is the next thing to try, and it is worth up to the 46% above.
 
+### Splitting PV across two warps buys 2%, not 23%
+
+`decode_partial_kernel_pv2` does the PV half of that: warp pair `(2r, 2r+1)`
+owns row `r`, the even warp keeps QK, softmax and the m/l state, and both warps
+run PV over 128 dims each (lane `l` owning `[half*128 + 4l, +4)`). Disjoint dims,
+so no reduction and no change to any lane's accumulation order - the variant is
+**bitwise identical to serial**, which `benchmarks/attn_variants.py` checks.
+
+| 256k, splits 80, lambda12 | two CTAs (shipped) | pv2 | |
+|---|---:|---:|---|
+| e5m2, TP2 | 0.624 ms | **0.610** | -2.2% |
+| e4m3, TP2 | 0.633 ms | **0.619** | -2.2% |
+| e5m2, TP1 | 1.232 ms | **1.201** | -2.5% |
+| fp16, TP2 | 0.952 ms | 0.970 | **+1.9%** |
+
+Doubling the compute warps for PV is worth 2%, so PV is a small part of the
+0.287 ms of exposed compute: if the compute phase were PV-bound, halving the PV
+chain would have shown up as roughly five times this. The cost side is visible
+too - pv2 pays a third barrier per tile and drops the PV loads from `LDS.128` to
+`LDS.64` (4 dims per lane instead of 8) - and fp16, whose compute is only 32% of
+its runtime and which is memory-bound, comes out **slower**. That is the control
+which says the win is real but bounded.
+
+So the exposed compute is not in PV. QK and the softmax shuffle chain are what is
+left, and QK is the one that can be spread over warps without changing shape: two
+warps over 128 dims each, one barrier, then an fp32 add of the two halves. That
+does change the summation order - each half accumulates 128 dims in fp16 and the
+halves are added in fp32 - so it stops being bitwise identical and has to be
+checked against the fp32 reference in `benchmarks/partial_check.py` instead.
+
 ### Two ways to mis-measure this, both hit on the way
 
 **Instrumentation is not free.** Bracketing the phases with `clock64` and
