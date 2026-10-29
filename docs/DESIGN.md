@@ -327,16 +327,54 @@ The open question is whether SM70's wmma path helps at q=1 shapes, or whether
 the arithmetic intensity is simply too low. That is measurable in one afternoon
 against `benchmarks/attn_dense.py`, which is why the harness ships here.
 
-Note, after the sections above: the numbers in the first paragraph of this
-section are the pre-HFMA2 decomposition and the "0.79 ms of memory" in it is the
-old serial kernel's, not the current memory floor. What has changed is that this
-section's question is no longer a hunch. The compute phase is 46% of the kernel,
-it is instruction-issue-bound rather than latency- or bandwidth-bound, and three
-attacks on it have now measured between -4.5% and 0.0% - with the best of the
-three being the one that deleted instructions rather than rearranging them.
-Tensor cores are the only remaining lever that changes the instruction count per
-result, and PV's `32 tokens x 256 dims` and QK's 256-dim dot are exactly the
-shapes `mma.sync.m16n8k16` covers.
+### Measured: wmma is 3.86x the HFMA2 rate on this part
+
+`benchmarks/mma_probe.cu` runs four `HFMA2` per iteration per thread against one
+`wmma::mma_sync` 16x16x16 per iteration per warp, both as dependency chains on
+their own accumulators, and reports MACs per cycle per SM:
+
+| on lambda12, V100-SXM2-32GB | GMAC/s | MAC/cycle/SM |
+|---|---:|---:|
+| `HFMA2` | 14,655 | 119.7 |
+| `wmma` 16x16x16 | 56,540 | 461.9 |
+| ratio | | **3.86x** |
+
+Both land within 10% of the part's theoretical rates (128 and 512), so this is
+the hardware, not a badly written loop.
+
+**What that is worth in the kernel, in cycles per tile on the SM.** QK and PV
+together are 98,304 useful MACs per tile per CTA, so 196,608 per SM with two
+CTAs resident:
+
+| | cycles per tile on the SM |
+|---|---:|
+| HFMA2 floor at 119.7 MAC/cycle | 821 |
+| measured compute phase | **2,132** |
+| wmma floor, M fully populated | 213 |
+| wmma floor at 6 rows of 16 (37.5% M) | 568 |
+
+So the compute phase, now 0.287 ms of a 0.620 ms kernel, has a tensor-core floor
+around 0.05-0.08 ms even at the poor M-fill this shape gives. That is a kernel
+near 0.39 ms - **about 35% off** - and it is the first lever since the start of
+this document that attacks the 46% rather than rearranging it.
+
+The 37.5% is the thing to fix while implementing: a CTA owns one kv head, which
+is 6 query rows, and an MMA tile is 16 rows wide. A CTA that owns **both** kv
+heads at TP2 fills 12 of 16 rows (75%) and halves the grid, at the cost of
+loading 512 B per token instead of 256 - the same total bytes, one allocation
+instead of two. That is the shape to build.
+
+Two caveats this measurement does not cover: the fragments have to be staged in
+shared memory in the layout `wmma::load_matrix_sync` wants, which is traffic the
+current kernel does not pay, and the online softmax sits between QK and PV, so
+at least one fragment round-trips through shared memory per tile. Expect the real
+kernel between the 213-cycle floor and today's 2,132, not at the floor.
+
+Note, after the sections above: the "0.79 ms of memory" in the first paragraph is
+the old serial kernel's decomposition, not the current memory floor, which is
+0.333 ms. And the sentence above about `benchmarks/attn_dense.py` is stale - the
+question it wanted answered is answered by `benchmarks/mma_probe.cu`, which needs
+no attention harness at all.
 
 ## Where the code came from, and what to port next
 
