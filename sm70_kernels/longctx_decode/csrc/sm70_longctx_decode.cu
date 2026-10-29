@@ -313,21 +313,26 @@ constexpr int kPipeLoadIters =
 // the launcher sets the dynamic-smem attribute (V100 allows 96 KB).
 constexpr int kPipeDynSmemBytes = 2 * 2 * kSmemKV * sizeof(__half);
 
-// Stage one 32-token K/V tile. Loads are issued as a batch before any of them
-// is consumed: the e5m2 path reads 16 bytes per request, so a load-convert-store
-// loop that waits on each request caps the grid at a few KB of bytes in flight
-// per SM and lands at ~330 GB/s, while the same code in fp16 (32 bytes per
-// request) reaches 640. batching kIters requests per thread is what closes gap.
-template <typename KV, int kTh, int kIters, bool kE4M3>
-__device__ __forceinline__ void pipe_load_tile(
+// Register staging for a tile a loader warp has fetched but not yet written to
+// smem. The fp16 read is two 16-byte vectors per lane and needs a register each;
+// the e5m2 read is one, so that path pays no second register.
+template <typename KV, int kIters>
+struct PipeRegs {
+  uint4 ra[kIters];
+  uint4 rb[sizeof(KV) == 1 ? 1 : kIters];
+  __half* dst[kIters];
+};
+
+// Phase one of a tile load: every request the tile needs is issued here and
+// lands in registers, so the caller can carry the tile across a barrier while
+// other warps compute on the previous one.
+template <typename KV, int kTh, int kIters>
+__device__ __forceinline__ void pipe_fetch_tile(
     const KV* __restrict__ k_cache, const KV* __restrict__ v_cache,
     const int* __restrict__ page_table, const int seq_id, const int kv_head,
     const int kv_stride, const int max_blocks, const int tile_begin,
     const int split_end, const int ltid, __half* __restrict__ ks,
-    __half* __restrict__ vs) {
-  uint4 ra[kIters];
-  uint4 rb[kIters];  // second half of an fp16 vector; unused for e5m2
-  __half* dstv[kIters];
+    __half* __restrict__ vs, PipeRegs<KV, kIters>& st) {
 #pragma unroll
   for (int it = 0; it < kIters; ++it) {
     const int v = ltid + it * kTh;
@@ -348,39 +353,62 @@ __device__ __forceinline__ void pipe_load_tile(
               : -1;
     // A tail iteration (v past the tile) must not write at all: the masked
     // zero would land on slots an earlier iteration already staged.
-    dstv[it] = live ? (is_v ? vs : ks) + tok_local * kKVStride + d_off : nullptr;
+    st.dst[it] = live ? (is_v ? vs : ks) + tok_local * kKVStride + d_off : nullptr;
     const uint4 zero = make_uint4(0, 0, 0, 0);
-    ra[it] = zero;
-    rb[it] = zero;
+    st.ra[it] = zero;
+    if constexpr (sizeof(KV) != 1) {
+      st.rb[it] = zero;
+    }
     if (valid) {
       const uint4* src = reinterpret_cast<const uint4*>(
           (is_v ? v_cache : k_cache) + base);
-      ra[it] = src[0];
+      st.ra[it] = src[0];
       if constexpr (sizeof(KV) != 1) {
-        rb[it] = src[1];
+        st.rb[it] = src[1];
       }
     }
   }
+}
+
+// Phase two: dequantize (or copy) the staged registers into the smem tile.
+template <typename KV, int kIters, bool kE4M3>
+__device__ __forceinline__ void pipe_store_tile(PipeRegs<KV, kIters>& st) {
 #pragma unroll
   for (int it = 0; it < kIters; ++it) {
-    if (dstv[it] == nullptr) {
+    if (st.dst[it] == nullptr) {
       continue;
     }
     if constexpr (sizeof(KV) == 1) {
-      // E5M2 shares the sign/exponent layout with FP16, so one byte becomes one
-      // half by shifting left eight bits; 16 bytes become two 16-byte stores.
-      // E4M3 does not, and takes the general conversion instead.
       if constexpr (kE4M3) {
-        e4m3_to_fp16_16(ra[it], dstv[it]);
+        e4m3_to_fp16_16(st.ra[it], st.dst[it]);
       } else {
-        e5m2_to_fp16_16(ra[it], dstv[it]);
+        e5m2_to_fp16_16(st.ra[it], st.dst[it]);
       }
     } else {
-      uint4* d = reinterpret_cast<uint4*>(dstv[it]);
-      d[0] = ra[it];
-      d[1] = rb[it];
+      uint4* d = reinterpret_cast<uint4*>(st.dst[it]);
+      d[0] = st.ra[it];
+      d[1] = st.rb[it];
     }
   }
+}
+
+// Stage one 32-token K/V tile. Loads are issued as a batch before any of them
+// is consumed: the e5m2 path reads 16 bytes per request, so a load-convert-store
+// loop that waits on each request caps the grid at a few KB of bytes in flight
+// per SM and lands at ~330 GB/s, while the same code in fp16 (32 bytes per
+// request) reaches 640. batching kIters requests per thread is what closes gap.
+template <typename KV, int kTh, int kIters, bool kE4M3>
+__device__ __forceinline__ void pipe_load_tile(
+    const KV* __restrict__ k_cache, const KV* __restrict__ v_cache,
+    const int* __restrict__ page_table, const int seq_id, const int kv_head,
+    const int kv_stride, const int max_blocks, const int tile_begin,
+    const int split_end, const int ltid, __half* __restrict__ ks,
+    __half* __restrict__ vs) {
+  PipeRegs<KV, kIters> st;
+  pipe_fetch_tile<KV, kTh, kIters>(k_cache, v_cache, page_table, seq_id,
+                                   kv_head, kv_stride, max_blocks, tile_begin,
+                                   split_end, ltid, ks, vs, st);
+  pipe_store_tile<KV, kIters, kE4M3>(st);
 }
 
 // kCtas = CTAs resident per SM. At two, the SM interleaves one CTA's load with
@@ -645,6 +673,150 @@ decode_partial_kernel_pipelined(const __half* __restrict__ q,
                      oh) *
                         kDim;
 #pragma unroll
+    store_partial_row(o_row, o_acc[r], inv_l, kv_scale);
+    if (lane == 0) {
+      const float lse =
+          l_row[r] > 0.f ? __log2f(l_row[r]) + m_row[r] * scale_log2 : -1.0e30f;
+      partial_lse[((int64_t)seq_id * max_splits + split_id) * heads_total +
+                  kv_head * kGroup + r] = lse;
+    }
+  }
+}
+
+// Pipeline plus occupancy. The shipped pipeline pays a second smem tile (67.6 KB)
+// to hold the prefetched tile, which leaves it one CTA per SM; at TP2 the grid is
+// kv_heads * splits = two CTAs per SM, so that pipeline runs its second residency
+// slot empty. Holding the prefetched tile in registers instead costs no smem, so
+// two CTAs stay resident and each one still overlaps its loads with its math.
+template <typename KV, bool kE4M3>
+__global__ void __launch_bounds__(kThreads, 2)
+decode_partial_kernel_regpipe(const __half* __restrict__ q,
+                              const KV* __restrict__ k_cache,
+                              const KV* __restrict__ v_cache,
+                              const int* __restrict__ page_table,
+                              const int* __restrict__ seq_lens,
+                              const int max_splits,
+                              const int min_tokens_per_split,
+                              const int max_blocks, const float score_scale,
+                              const float kv_scale,
+                              __half* __restrict__ partial_o,
+                              float* __restrict__ partial_lse) {
+  const int kv_head = blockIdx.x;
+  const int kv_heads = gridDim.x;
+  const int kv_stride = kDim * kv_heads;  // per-token elements across KV heads
+  const int heads_total = kGroup * kv_heads;
+  const int split_id = blockIdx.y;
+  const int seq_id = blockIdx.z;
+
+  __shared__ __half ks[kSmemKV];
+  __shared__ __half vs[kSmemKV];
+  __shared__ __half qs[kGroup * kDim];
+  __shared__ float scores[kGroup * kBlockN];
+  __shared__ __half probs[kGroup * kBlockN];
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const bool is_compute_warp = warp < kPipeComputeWarps;
+  const int ltid = tid - kPipeComputeThreads;  // valid for loader warps only
+
+  const int context = seq_lens[seq_id];
+  const int active_splits =
+      min(max_splits, max(1, (context + min_tokens_per_split - 1) /
+                                 min_tokens_per_split));
+  if (split_id >= active_splits || context <= 0) {
+    return;
+  }
+  const int split_len = (context + active_splits - 1) / active_splits;
+  const int split_begin = split_id * split_len;
+  const int split_end = min(context, split_begin + split_len);
+  if (split_begin >= split_end) {
+    if (is_compute_warp) {
+      __half* o_row =
+          partial_o +
+          (((int64_t)seq_id * max_splits + split_id) * heads_total +
+           kv_head * kGroup + warp) *
+              kDim;
+      for (int d = lane; d < kDim; d += 32) {
+        o_row[d] = __float2half(0.f);
+      }
+      if (lane == 0) {
+        partial_lse[((int64_t)seq_id * max_splits + split_id) * heads_total +
+                    kv_head * kGroup + warp] = -1.0e30f;
+      }
+    }
+    return;
+  }
+  const float scale_log2 = score_scale * kLog2E;
+
+  for (int i = tid; i < kGroup * kDim; i += kThreads) {
+    const int r = i / kDim;
+    const int d = i % kDim;
+    qs[r * kDim + d] = q[(kv_head * kGroup + r) * kDim + d];
+  }
+
+  float m_row[kGroup];
+  float l_row[kGroup];
+  float o_acc[kGroup][kAccPerLane];
+#pragma unroll
+  for (int r = 0; r < kGroup; ++r) {
+    m_row[r] = -1.0e30f;
+    l_row[r] = 0.f;
+  }
+  if (is_compute_warp) {
+#pragma unroll
+    for (int j = 0; j < kAccPerLane; ++j) {
+      o_acc[warp][j] = 0.f;
+    }
+  }
+
+  const int num_tiles = (split_end - split_begin + kBlockN - 1) / kBlockN;
+
+  // Prologue: the loader warps stage tile 0 while the others finish the queries.
+  if (!is_compute_warp) {
+    PipeRegs<KV, kPipeLoadIters> st;
+    pipe_fetch_tile<KV, kPipeLoadThreads, kPipeLoadIters>(
+        k_cache, v_cache, page_table, seq_id, kv_head, kv_stride, max_blocks,
+        split_begin, split_end, ltid, ks, vs, st);
+    pipe_store_tile<KV, kPipeLoadIters, kE4M3>(st);
+  }
+  __syncthreads();
+
+  for (int tile = 0; tile < num_tiles; ++tile) {
+    const bool more = tile + 1 < num_tiles;
+    if (!is_compute_warp) {
+      PipeRegs<KV, kPipeLoadIters> st;
+      if (more) {
+        // Issued before the barrier, so these requests are in flight while the
+        // compute warps work through tile on the smem buffer.
+        pipe_fetch_tile<KV, kPipeLoadThreads, kPipeLoadIters>(
+            k_cache, v_cache, page_table, seq_id, kv_head, kv_stride,
+            max_blocks, split_begin + (tile + 1) * kBlockN, split_end, ltid,
+            ks, vs, st);
+      }
+      __syncthreads();
+      if (more) {
+        pipe_store_tile<KV, kPipeLoadIters, kE4M3>(st);
+      }
+    } else {
+      const int tile_begin = split_begin + tile * kBlockN;
+      const int tile_tokens = min(kBlockN, split_end - tile_begin);
+      decode_tile_compute(warp, tile_tokens, ks, vs, qs, scores,
+                          probs, m_row[warp], l_row[warp],
+                          o_acc[warp], scale_log2);
+      __syncthreads();
+    }
+    __syncthreads();
+  }
+
+  if (is_compute_warp) {
+    const int r = warp;
+    const float inv_l = l_row[r] > 0.f ? 1.f / l_row[r] : 0.f;
+    const int oh = kv_head * kGroup + r;
+    __half* o_row = partial_o +
+                    (((int64_t)seq_id * max_splits + split_id) * heads_total +
+                     oh) *
+                        kDim;
     store_partial_row(o_row, o_acc[r], inv_l, kv_scale);
     if (lane == 0) {
       const float lse =
@@ -1256,6 +1428,41 @@ inline void dispatch_serial(const DecodeArgs& a, cudaStream_t stream,
   }
 }
 
+template <typename KV, bool kE4M3>
+inline void launch_regpipe(const DecodeArgs& a, cudaStream_t stream,
+                           const torch::Tensor& q, const torch::Tensor& k_cache,
+                           const torch::Tensor& v_cache,
+                           const torch::Tensor& seq_lens,
+                           torch::Tensor& partial_o,
+                           torch::Tensor& partial_lse) {
+  decode_partial_kernel_regpipe<KV, kE4M3><<<a.grid, kThreads, 0, stream>>>(
+      reinterpret_cast<const __half*>(q.data_ptr()),
+      reinterpret_cast<const KV*>(k_cache.data_ptr()),
+      reinterpret_cast<const KV*>(v_cache.data_ptr()), a.page_ptr,
+      seq_lens.data_ptr<int>(), a.max_splits, a.min_tokens, a.max_blocks,
+      a.scale_k, a.vscale, reinterpret_cast<__half*>(partial_o.data_ptr()),
+      partial_lse.data_ptr<float>());
+}
+
+inline void dispatch_regpipe(const DecodeArgs& a, cudaStream_t stream,
+                             const torch::Tensor& q,
+                             const torch::Tensor& k_cache,
+                             const torch::Tensor& v_cache,
+                             const torch::Tensor& seq_lens,
+                             torch::Tensor& partial_o,
+                             torch::Tensor& partial_lse) {
+  if (a.e4m3) {
+    launch_regpipe<uint8_t, true>(a, stream, q, k_cache, v_cache, seq_lens,
+                                  partial_o, partial_lse);
+  } else if (a.byte_cache) {
+    launch_regpipe<uint8_t, false>(a, stream, q, k_cache, v_cache, seq_lens,
+                                   partial_o, partial_lse);
+  } else {
+    launch_regpipe<__half, false>(a, stream, q, k_cache, v_cache, seq_lens,
+                                  partial_o, partial_lse);
+  }
+}
+
 // Dynamic smem above 48 KB needs the opt-in attribute set once per entry
 // point; V100 allows up to 96 KB with 1 KB reserved.
 // One int rather than <type, bool>: TORCH_CHECK is a macro and the comma in a
@@ -1387,6 +1594,26 @@ void sm70_longctx_decode_pipelined(
             reinterpret_cast<__half*>(partial_o.data_ptr()),
             partial_lse.data_ptr<float>());
   }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Pipeline with the prefetched tile in registers rather than a second smem
+// buffer, so it keeps two CTAs resident per SM alongside the shipped pipeline's
+// software overlap.
+void sm70_longctx_decode_regpipe(torch::Tensor q, torch::Tensor k_cache,
+                                 torch::Tensor v_cache, torch::Tensor page_table,
+                                 torch::Tensor seq_lens, int64_t max_splits,
+                                 int64_t min_tokens_per_split,
+                                 double softmax_scale, double k_scale,
+                                 double v_scale, torch::Tensor partial_o,
+                                 torch::Tensor partial_lse) {
+  c10::cuda::CUDAGuard guard(q.device());
+  const DecodeArgs a =
+      decode_args(q, k_cache, v_cache, page_table, max_splits,
+                  min_tokens_per_split, softmax_scale, k_scale, v_scale);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dispatch_regpipe(a, stream, q, k_cache, v_cache, seq_lens, partial_o,
+                   partial_lse);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1542,6 +1769,8 @@ void sm70_qsa_prefill(torch::Tensor q, torch::Tensor k_cache,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sm70_longctx_decode_occ2", &sm70_longctx_decode_occ2,
         "split-KV decode with two CTAs resident per SM");
+  m.def("sm70_longctx_decode_regpipe", &sm70_longctx_decode_regpipe,
+        "split-KV decode: register-staged pipeline, two CTAs per SM");
   m.def("sm70_longctx_decode", &sm70_longctx_decode,
         "Long-context grouped decode partial (D256 G6 E5M2)");
   m.def("sm70_longctx_decode_pipelined",

@@ -88,6 +88,9 @@ def sm70_cuda_decode_partial(
     variant:    "serial"    - all warps load, then six warps compute
                 "occ2"      - serial, two CTAs per SM so the SM overlaps them
                 "pipelined" - ten warps stream tile i+1 while six compute i
+                "regpipe"   - as pipelined, but tile i+1 waits in registers
+                              instead of a second smem buffer, so two CTAs
+                              stay resident per SM
     """
     ext = _load_ops()
     if ext is None:
@@ -108,6 +111,7 @@ def sm70_cuda_decode_partial(
         "serial": ext.sm70_longctx_decode,
         "occ2": ext.sm70_longctx_decode_occ2,
         "pipelined": ext.sm70_longctx_decode_pipelined,
+        "regpipe": ext.sm70_longctx_decode_regpipe,
     }[variant]
     entry(
         q.contiguous(), kv(k_cache).contiguous(), kv(v_cache).contiguous(),
