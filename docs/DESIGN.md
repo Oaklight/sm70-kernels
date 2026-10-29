@@ -64,6 +64,70 @@ All three variants agree with an fp32 per-split reference to 1.6e-3 absolute on
 a signal of RMS 0.101 (`benchmarks/partial_check.py`), and serial, occ2 and
 pipelined agree with each other bit for bit (`benchmarks/attn_variants.py`).
 
+## Pipeline plus occupancy does not add up (2026-10-28)
+
+The two fixes above attack the same stall from opposite ends: batching keeps more
+requests in flight inside a CTA, and a second resident CTA overlaps one CTA's
+loads with the other's math. If both were buying bytes in flight, doing both
+should beat either. It does not.
+
+`decode_partial_kernel_regpipe` is the pipelined kernel with the prefetched tile
+held in **registers** instead of a second smem buffer. That is the only thing
+keeping the shipped pipeline at one CTA per SM: the double buffer is
+`2 * 2 * kSmemKV = 67.6 KB` of dynamic smem. The register version stages four
+vectors per loader thread (16 registers on the e5m2 path, 32 on fp16) and stays
+at 37 KB, so two CTAs remain resident. At TP2 the grid is
+`kv_heads * splits` = two CTAs per SM, which is exactly the residency slot the
+shipped pipeline leaves empty; at TP1 it is four, i.e. two waves of two.
+
+| at 256k, splits 80, lambda12 | TP2 e5m2 | TP2 e4m3 | TP1 e5m2 | TP1 e4m3 |
+|---|---:|---:|---:|---:|
+| serial | 0.862 | 0.870 | 1.699 | 1.715 |
+| **two CTAs per SM** | **0.620** | **0.632** | **1.231** | **1.249** |
+| warp-specialized pipeline | 0.712 | 0.721 | 1.407 | 1.419 |
+| pipeline + two CTAs (registers) | 0.660 | 0.664 | 1.294 | 1.304 |
+
+Trading the second smem buffer for registers recovers 57% of the pipeline's
+deficit to the occupancy variant at TP2 and 64% at TP1, and none of the rest:
+0.660 against 0.620 ms. Every cell of the table says the same thing, and all four
+variants are bitwise identical to serial (`max|do|` and `max|dlse|` both 0).
+
+So this rules out two candidate explanations at once:
+
+- **Overlap is not additive.** A CTA that overlaps its own loads with its own
+  math gives the SM nothing that a second resident CTA was not already giving it.
+  The two mechanisms are substitutes, not terms in a sum.
+- **Per-thread request depth is not the constraint.** An e5m2 loader thread in
+  regpipe issues four requests (`kPipeLoadThreads` 320 against
+  `kPipeVecPerTile` 1024) where the serial and occupancy kernels issue two -
+  which is the depth fp16 reaches by accident, and was the best remaining
+  explanation for fp16 sitting at 569 GB/s where e5m2 sat at 431. Same total
+  bytes, twice the depth, no movement. What is left is bytes per request.
+
+Register pressure is not the explanation either: `__launch_bounds__(kThreads, 2)`
+caps regpipe at 64 registers, and the shipped occupancy kernel already runs at
+exactly 64 (`cuobjdump -res-usage`), so the cap takes nothing from the compute
+path that it was not already giving up.
+
+The open question is narrower than it was: an e5m2 kernel at 431 GB/s of a
+776 GB/s copy ceiling is not short of concurrency, so the remaining gap is in the
+request itself - 16 bytes against fp16's 32 - or in the access pattern. The
+683 GB/s that the loop-cut measurement above reaches on the serial structure is
+the number to explain.
+
+### The harness was charging the clock ramp
+
+Every number in this section comes from `benchmarks/attn_variants.py`, which used
+to time each variant straight after 40 warmup launches - about 40 ms of load. A
+V100 idles at 1290 MHz and only reaches 1530 under sustained load, so the harness
+under-reported by 7% and charged all of it to whichever variant ran first.
+`--clock-warmup` (2 s by default) now spins the clock before anything is timed,
+and `--passes` reports the best of several timed passes. Serial at TP2 moves from
+1.002 to 0.862 ms with no change to the kernel, while the occupancy number, which
+had been measured warm, does not move. A `--dtype` list that did not end in fp16
+also inflated the reported bandwidth of the earlier dtypes, because the `fp16`
+doubling mutated a shared `moved`; that is fixed too.
+
 ## Where tensor cores would go
 
 What is left is 0.79 ms of memory and ~0.8 ms of math that half2 cannot reach.
