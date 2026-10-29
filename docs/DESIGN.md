@@ -113,7 +113,8 @@ The open question is narrower than it was: an e5m2 kernel at 431 GB/s of a
 776 GB/s copy ceiling is not short of concurrency, so the remaining gap is in the
 request itself - 16 bytes against fp16's 32 - or in the access pattern. The
 683 GB/s that the loop-cut measurement above reaches on the serial structure is
-the number to explain.
+the number to explain - and the next section explains it, in a way that makes
+both candidates moot: that number is not a memory ceiling at all.
 
 ### The harness was charging the clock ramp
 
@@ -128,6 +129,81 @@ had been measured warm, does not move. A `--dtype` list that did not end in fp16
 also inflated the reported bandwidth of the earlier dtypes, because the `fp16`
 doubling mutated a shared `moved`; that is fixed too.
 
+## The kernel is compute-blocked, and the GB/s question was malformed (2026-10-28)
+
+Everything above reasons about bandwidth. One measurement replaces that with
+something simpler: delete the compute phase and time what is left.
+
+`decode_tile_compute` is removed from `decode_partial_kernel` (the serial and
+occupancy variants) and replaced with a two-`LDS` sink so ptxas cannot delete the
+loads it just staged. Everything else - the loads, the E5M2 conversion, the smem
+stores, both barriers per tile - stays. At TP2/256k, splits 80, lambda12:
+
+| | full kernel | compute removed | exposed compute |
+|---|---:|---:|---:|
+| e5m2, boost 1530 MHz | 0.620 ms (431 GB/s) | **0.333 ms (805 GB/s)** | 0.287 ms, 46% |
+| fp16, boost 1530 MHz | 0.944 ms (568 GB/s) | **0.638 ms (842 GB/s)** | 0.306 ms, 32% |
+| e5m2, 1300 MHz | 0.723 ms | 0.333 ms | 0.390 ms, 54% |
+| fp16, 1300 MHz | 0.974 ms | 0.638 ms | 0.336 ms, 35% |
+
+The two clock rows are not padding, they are the check. The compute-free arm is
+DRAM-bound, so its time is set by the bytes and does not move with the SM clock;
+the full arm's does, and by very different amounts - e5m2 0.723 -> 0.620 (17%)
+against fp16 0.974 -> 0.944 (3%). That split is exactly the compute-bound against
+memory-bound signature, measured without any counters.
+
+Two things fall out of the table.
+
+**The memory path was never the problem.** The same access pattern, grid and
+byte path reaches 805 GB/s the moment the compute stops blocking it - above the
+776 GB/s a copy benchmark manages - and the assembled kernel collects 431. The
+kernel is at 54% of the bandwidth its own loads can sustain, and the missing 46%
+is the compute phase holding the next tile's load behind a barrier. Nothing in
+the memory path (batching, pipelines, occupancy, more splits) can recover time
+that is being lost in the compute warps.
+
+**The two dtypes expose the same compute.** 0.287 and 0.306 ms, from kernels
+whose memory halves differ by 1.9x. That is what a per-tile fixed cost looks
+like, and it means the "e5m2 at 431 against fp16 at 658 GB/s" comparison that
+this document has been chasing since it was written was measuring the wrong
+thing: on the same shape fp16 reports 568 GB/s only because it has twice the
+bytes to hide the same compute behind. Per token, which is what a decode step
+pays for, e5m2 is 1.52x faster - 0.620 against 0.944 ms for the same 262144
+tokens.
+
+So there is no e5m2 bandwidth problem to solve. The next question is the compute
+phase, and the first fact about it is that it runs on six of the sixteen warps:
+`is_compute_warp = warp < kGroup` gives one warp per query row and leaves ten
+warps idle at the barrier while they wait. PV splits across more warps with no
+reduction at all (lane `l` owns dims `[8l, 8l+8)`, so two warps per row can own
+half each); QK needs the 256-dim dot split with a cross-warp add instead. That
+is the next thing to try, and it is worth up to the 46% above.
+
+### Two ways to mis-measure this, both hit on the way
+
+**Instrumentation is not free.** Bracketing the phases with `clock64` and
+accumulating per thread pushed the stack frame from 240 to 288 bytes - the
+kernel stays at 64 registers under `__launch_bounds__(kThreads, 2)`, so the
+counters spill - and the kernel read 0.836 ms against 0.620. Moving the
+accumulators to shared memory and reading the clock on one thread only brought
+the frame to 272 and the time to 0.790. Any phase split taken from counters on
+this kernel is measured through that perturbation; the differential above needs
+no counters and is why it is the one quoted.
+
+**And the clock is worse than it looks.** A memory-heavy kernel does not hold the
+V100's boost: whichever block is timed first in a fresh process sits at about
+1300 MHz, and it stays there even after a matmul ramp reads 1522 MHz a second
+earlier - the clock falls as soon as the decode kernel starts. That is why the
+table above carries two clock rows rather than one nominal 1530. It also means
+`torch.cuda.clock_rate()` sampled between blocks is not evidence about the block
+that just ran, and that any figure quoted for this kernel without the clock it
+was measured at is worth about 17%.
+
+The useful consequence is that the clock makes a free second experiment: a
+compute-bound kernel slows by the clock ratio (e5m2: 17%) and a memory-bound one
+barely moves (fp16: 3%), so one measurement at each clock separates the two terms
+without instrumenting anything.
+
 ## Where tensor cores would go
 
 What is left is 0.79 ms of memory and ~0.8 ms of math that half2 cannot reach.
@@ -138,6 +214,16 @@ exists separately: kernel experiments should not need an engine checkout.
 The open question is whether SM70's wmma path helps at q=1 shapes, or whether
 the arithmetic intensity is simply too low. That is measurable in one afternoon
 against `benchmarks/attn_dense.py`, which is why the harness ships here.
+
+Note, after the section above: the numbers in the first paragraph of this section
+are the pre-HFMA2 decomposition and the "0.79 ms of memory" in it is the old
+serial kernel's, not the current memory floor. The question this section asks -
+whether tensor cores help at q=1 - is now the *right* one, because the compute
+phase is 46% of the kernel and removing it recovers exactly that, while every
+memory-side change has stopped paying. Tensor cores would attack the QK dot and
+the PV reduction on the same six warps; splitting those across twelve warps is
+the cheaper experiment and should be tried first, since it needs no new math
+shape and PV has no reduction to add.
 
 ## Where the code came from, and what to port next
 
