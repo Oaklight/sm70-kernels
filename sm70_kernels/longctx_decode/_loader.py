@@ -91,6 +91,8 @@ def sm70_cuda_decode_partial(
                 "regpipe"   - as pipelined, but tile i+1 waits in registers
                               instead of a second smem buffer, so two CTAs
                               stay resident per SM
+                "pv2"       - PV split across two warps per query row, so the
+                              compute phase runs on twelve warps not six
     """
     ext = _load_ops()
     if ext is None:
@@ -112,6 +114,7 @@ def sm70_cuda_decode_partial(
         "occ2": ext.sm70_longctx_decode_occ2,
         "pipelined": ext.sm70_longctx_decode_pipelined,
         "regpipe": ext.sm70_longctx_decode_regpipe,
+        "pv2": ext.sm70_longctx_decode_pv2,
     }[variant]
     entry(
         q.contiguous(), kv(k_cache).contiguous(), kv(v_cache).contiguous(),

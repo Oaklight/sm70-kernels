@@ -22,7 +22,7 @@ from sm70_kernels.longctx_decode._loader import (
 
 DIM = 256
 PAGE = 16
-VARIANTS = ("serial", "occ2", "pipelined", "regpipe")
+VARIANTS = ("serial", "occ2", "pipelined", "regpipe", "pv2")
 
 
 def _make(ctx, heads_kv, dtype, device):
@@ -133,6 +133,7 @@ def main():
                         f"ctx={ctx:>6} kvh={heads_kv} {dtype:4s} splits={splits:>3} "
                         f"serial={row['serial']:7.3f} occ2={row['occ2']:7.3f} "
                         f"pipe={row['pipelined']:7.3f} regpipe={row['regpipe']:7.3f} "
+                        f"pv2={row['pv2']:7.3f} "
                         f"best=x{row['serial'] / best:4.2f} "
                         f"bw={moved / 1e9 / (best / 1e3):6.1f}GB/s "
                         f"max|do|={d_o:.2e} max|dlse|={d_l:.2e}",
