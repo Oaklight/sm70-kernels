@@ -248,6 +248,49 @@ rather than the bitwise check:
 - **QK over the dim axis**: two warps, 128 dims each, one fp32 add of the two
   halves. Halves the chain and changes the fp16 accumulation grouping too.
 
+### All three of those levers are dead. It is instruction issue.
+
+Both splits above were built in scratch trees before being written up, and
+neither survived contact. Three probes, all on `decode_partial_kernel` at
+e5m2/TP2/256k, splits 80, warm clock:
+
+| probe | what changes | result |
+|---|---|---:|
+| pv2, already shipped | half the lanes' work, twice the warps | -2.2% |
+| two accumulator sets, even and odd tokens | chain 32 -> 16, same instructions | **0.0%** (0.622 vs 0.623) |
+| reuse the previous V vector on odd tokens | half the PV `LDS.128`, same FLOPs | -4.5% (0.597 vs 0.625) |
+
+The middle row is the one that matters: **PV is not latency-bound**. Halving its
+dependency chain does nothing at all. The first row says spreading the same work
+over twice the warps does nothing either, and the third says halving the shared
+memory traffic buys 4.5% where pure bandwidth would have bought about 10%. So it
+is neither chain, nor warp count, nor shared memory - it is how many instructions
+the phase has to issue:
+
+- PV per tile per CTA is 6 rows x 32 tokens x 256 dims = 49,152 multiplies. As
+  `HFMA2` that is 24,576 instructions, or 768 warp-instructions. QK is the same
+  shape and the same count: 1,536 warp-instructions per tile per CTA.
+- Two CTAs per SM make that 3,072 warp-instructions per SM per tile, and an SM
+  issues at most 4 warp-instructions per cycle. **Floor: 768 cycles.**
+- Measured compute is 0.287 ms over 103 tiles, 2.79 us per tile. At 1530 MHz
+  that is 4,264 cycles per tile per CTA, so 2,132 per tile on the SM - **2.8x the
+  FMA-only floor**, and the loads, conversions and loop control make up most of
+  the difference.
+
+2.8x sounds like headroom, but it is headroom in instructions already being
+issued, not in stalls that can be filled. Scheduling work cannot beat an issue
+floor; only fewer instructions can, and no rearrangement of warps, chains or
+loads changes the number of `HFMA2` a tile needs. That is the argument for
+tensor cores, and it is now a measured one rather than an intuition: at these
+shapes PV is `32 tokens x 256 dims` per row and QK is `q . k` over 256 dims,
+which is what `mma.sync.m16n8k16` exists for.
+
+The alternative to tensor cores is to move the work off the compute warps
+entirely - the 10 idle warps are idle for a reason (they wait at a barrier while
+6 compute), but a variant where *all 16* warps compute would only help if issue
+slots were the limit rather than instructions, and the pv2 row above says they
+are not.
+
 ### Two ways to mis-measure this, both hit on the way
 
 **Instrumentation is not free.** Bracketing the phases with `clock64` and
@@ -284,15 +327,16 @@ The open question is whether SM70's wmma path helps at q=1 shapes, or whether
 the arithmetic intensity is simply too low. That is measurable in one afternoon
 against `benchmarks/attn_dense.py`, which is why the harness ships here.
 
-Note, after the section above: the numbers in the first paragraph of this section
-are the pre-HFMA2 decomposition and the "0.79 ms of memory" in it is the old
-serial kernel's, not the current memory floor. The question this section asks -
-whether tensor cores help at q=1 - is now the *right* one, because the compute
-phase is 46% of the kernel and removing it recovers exactly that, while every
-memory-side change has stopped paying. Tensor cores would attack the QK dot and
-the PV reduction on the same six warps; splitting those across twelve warps is
-the cheaper experiment and should be tried first, since it needs no new math
-shape and PV has no reduction to add.
+Note, after the sections above: the numbers in the first paragraph of this
+section are the pre-HFMA2 decomposition and the "0.79 ms of memory" in it is the
+old serial kernel's, not the current memory floor. What has changed is that this
+section's question is no longer a hunch. The compute phase is 46% of the kernel,
+it is instruction-issue-bound rather than latency- or bandwidth-bound, and three
+attacks on it have now measured between -4.5% and 0.0% - with the best of the
+three being the one that deleted instructions rather than rearranging them.
+Tensor cores are the only remaining lever that changes the instruction count per
+result, and PV's `32 tokens x 256 dims` and QK's 256-dim dot are exactly the
+shapes `mma.sync.m16n8k16` covers.
 
 ## Where the code came from, and what to port next
 
