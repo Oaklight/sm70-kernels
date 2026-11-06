@@ -12,7 +12,7 @@ The package imports without CUDA present; every kernel loads lazily on first use
 and raises a clear error if the device or the toolchain does not fit.
 """
 
-from . import longctx_decode
+from . import longctx_decode, tilelang_fa
 
-__all__ = ["longctx_decode"]
+__all__ = ["longctx_decode", "tilelang_fa"]
 __version__ = "0.1.0"

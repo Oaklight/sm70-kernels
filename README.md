@@ -54,6 +54,25 @@ all of it in seconds.
 ## Status
 
 - `longctx_decode` — working, measured, and shipped in the fork we run.
-- `tilelang_fa` — not vendored here yet; it currently lives in
-  `sglang-restomod`'s `attention/v100` component. Moving it here is tracked as
-  the next step.
+- `tilelang_fa` — the paged prefill/extend kernel lives here as the source of
+  truth (`tilelang_fa/_kernels_paged.py`); `sglang-restomod` syncs it through
+  its `UPSTREAM_PIN.toml` submodule. The fp8 gather and grouped decode modules
+  still live only in restomod.
+
+## Paged extend: Q in registers, block_N=64
+
+The dim-256 prefill tile was pinned by shared memory: with a 32 KiB Q tile in
+shared, `block_N=64` needs 108 KiB against the 96 KiB cap. Holding Q in a
+fragment instead lets `block_N=64` fit at 72 KiB (K 32 + V 32 + P 8), which
+halves the KV-loop iteration count. Same inputs, one V100, 4096 extend rows,
+12 heads / 2 KV heads, page 16 (`benchmarks/attn_prefill.py`):
+
+| prefix | shared Q 64x32 | Q fragment 64x64 | ratio |
+|---:|---:|---:|---:|
+| 8,192 | 16.09 ms | **13.17 ms** | 0.82 |
+| 32,768 | 53.15 ms | **41.35 ms** | 0.78 |
+| 98,304 | 155.30 ms | **122.35 ms** | 0.79 |
+
+Max absolute difference against the shared-Q tile is 6.1e-05 on an output of
+RMS 0.05. `num_stages=1` and the head-dim-split variants were measured and are
+slower; see the lab note.
