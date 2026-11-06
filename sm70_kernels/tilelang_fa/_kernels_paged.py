@@ -1,7 +1,7 @@
 # Source of truth for the SM70 paged extend kernel. Vendored from
 # dg1kjd/sglang-sxm2 @ 73abfe1 (python/sglang/srt/layers/attention/tilelang_fa_v100/
-# _kernels_paged.py) with the Oaklight/lambda-v100-lab patches, then this
-# repository's head_dim-in-registers change. sglang-restomod syncs this file
+# _kernels_paged.py) with the Oaklight/lambda-v100-lab patches, then the
+# Q-in-registers change. sglang-restomod syncs this file
 # through UPSTREAM_PIN.toml, so the copy there is generated, not edited.
 """Paged FlashAttention forward kernel for V100 (SM70).
    4D page-by-page loading handles scattered vLLM page blocks correctly.
