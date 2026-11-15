@@ -99,3 +99,10 @@ halves the KV-loop iteration count. Same inputs, one V100, 4096 extend rows,
 Max absolute difference against the shared-Q tile is 6.1e-05 on an output of
 RMS 0.05. `num_stages=1` and the head-dim-split variants were measured and are
 slower; see the lab note.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) for the terms and [NOTICE](NOTICE) for the
+upstream attribution: `longctx_decode`'s CUDA source and `tilelang_fa`'s paged
+kernel are derivative of `dg1kjd/sglang-sxm2` at `73abfe1`, the latter through
+`haohervchb/GooseLLM` `3rdparty/tilelang-fa-v100`.

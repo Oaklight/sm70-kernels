@@ -1,0 +1,80 @@
+sm70-kernels
+============
+
+GPU kernels for NVIDIA V100 (SM70) inference: long-context split-KV decode
+attention and TileLang FlashAttention.
+
+Copyright 2026 Oaklight contributors
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Derivative files
+----------------
+
+Two files here are derivative works of upstream code, both Apache-2.0 at the
+source. The rest of the repository is original to this project.
+
+sm70_kernels/longctx_decode/csrc/sm70_longctx_decode.cu
+  Derived from python/sglang/kernels/jit/csrc/sm70_longctx_decode.cu in
+  dg1kjd/sglang-sxm2 at 73abfe1dd7e7aae7a62b222a201e48f532fb298e.
+
+  Ours: the E5M2 byte-KV path and the fp16 path; two uninitialised reads fixed
+  in the split combine (probs[] lanes past tile_tokens, empty trailing splits
+  returning before writing o/lse); HFMA2 QK accumulation; per-tile half2 PV
+  accumulation folded into fp32 once per tile.
+
+sm70_kernels/tilelang_fa/_kernels_paged.py
+  Derived from python/sglang/srt/layers/attention/tilelang_fa_v100/_kernels_paged.py
+  in dg1kjd/sglang-sxm2 at the same commit, itself vendored from
+  haohervchb/GooseLLM 3rdparty/tilelang-fa-v100.
+
+  Ours: the per-iteration T.clear of the K/V shared tiles hoisted out of the
+  loop; the PV gemm reading P_shared directly; softmax through exp2; and the
+  dim-256 tile holding Q in a fragment so block_N=64 fits.
+
+Everything else is ours: the extension build and load path, the package
+initialisers, tests, benchmarks, docs, packaging and PROVENANCE.md. The file
+list and the change lists above are those in PROVENANCE.md.
+
+Upstream attribution
+--------------------
+
+  dg1kjd/sglang-sxm2
+  https://github.com/dg1kjd/sglang-sxm2
+  commit 73abfe1dd7e7aae7a62b222a201e48f532fb298e
+  Apache License 2.0
+
+  haohervchb/GooseLLM -- 3rdparty/tilelang-fa-v100
+  https://github.com/haohervchb/GooseLLM
+  Apache License 2.0
+
+  The vendoring chain, as recorded in docs/DESIGN.md:
+  haohervchb/Tilelang-FA-V100 (c6332eb) -> GooseLLM 3rdparty/tilelang-fa-v100
+  (7a9e958) -> haohervchb/sglang-V100 (46daf6279) -> dg1kjd/sglang-sxm2
+  (73abfe1).
+
+  dg1kjd/sglang-sxm2 is itself based on SGLang
+  https://github.com/sgl-project/sglang
+  Copyright 2023-2024 SGLang Team
+  Licensed under the Apache License, Version 2.0
+
+Retained notices
+----------------
+
+Retained from the NOTICE file of dg1kjd/sglang-sxm2 at the commit above, as
+required by section 4(d) of the Apache License 2.0:
+
+    SGLang -- the inference engine
+    https://github.com/sgl-project/sglang
+    Copyright 2023-2024 SGLang Team
+    Licensed under the Apache License, Version 2.0
+
+    sglang-V100 -- the original Volta (sm70) port of SGLang
+    https://github.com/haohervchb/sglang-V100
+    Parts of the sm70 kernels, the Qwen4-Exp model support and the serving
+    recipes carried here originate in that repository.
+    Related: https://github.com/haohervchb/flashinfer (sm70 FlashInfer)
+             https://github.com/haohervchb/GooseLLM (TileLang FlashAttention
+             and GDN kernels for V100, Apache 2.0)
+
+This is an independent project. It is not affiliated with, endorsed by, or
+supported by the SGLang project, GooseLLM, or the repositories above.
