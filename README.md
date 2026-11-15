@@ -10,6 +10,29 @@ Two families:
 |---|---|---|
 | `sm70_kernels.longctx_decode` | split-KV decode attention for long context: E5M2 byte KV or fp16, per-split partial + LSE, HFMA2 QK / per-tile half2 PV | ours, evolved from `dg1kjd/sglang-sxm2` |
 | `sm70_kernels.tilelang_fa` | TileLang FlashAttention for SM70: paged prefill, fp8 gather, grouped decode | vendored from [GooseLLM](https://github.com/haohervchb/GooseLLM) `3rdparty/tilelang-fa-v100` |
+| `sm70_kernels.gdn_chunk_o` | TileLang GDN chunk output `(q h^T + A v)`, causal and gated | ours, new work |
+| `sm70_kernels.gdn_chunk_h` | TileLang GDN chunk state pass, state in an fp32 fragment | ours, new work |
+
+## GDN chunked prefill (new)
+
+No linear-attention kernel existed in this repo before these two. They replace
+the Triton `chunk_fwd_kernel_o` / `chunk_gated_delta_rule_fwd_kernel_h` pair in
+the SGLang GDN prefill. Shapes are per TP rank (B=1, T=4096, H=12, Hg=4,
+K=V=128, BT=64).
+
+| kernel | Triton | TileLang | speedup |
+|---|---|---|---|
+| `gdn_chunk_o` | 25.12 ms | 0.23 ms | 108x |
+| `gdn_chunk_h` | 15.4 ms | 0.47 ms | 33x |
+
+Generated CUDA contains `mma_sync_sm70` for both. Accuracy against an fp32
+reference: 0.74 ULP for chunk_o (Triton itself is 0.64), 0.75-1.13 ULP for the
+chunk_h outputs. Why Triton loses on this target at all: its PTX has zero
+`mma.sync` and the kernel spills 5258 registers per thread, so it also cannot
+launch alongside a server that leaves under ~2 GB free.
+
+Current restriction: B=1, T a multiple of 64, no varlen. The SGLang dispatch
+falls back to Triton for anything else.
 
 ## Why a separate repo
 
