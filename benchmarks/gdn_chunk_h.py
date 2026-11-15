@@ -12,7 +12,7 @@ Measured on a V100-SXM2: Triton 15.4 ms, TileLang 0.47 ms (33x).
     python benchmarks/gdn_chunk_h.py --tokens 4096
     python benchmarks/gdn_chunk_h.py --tokens 4096 --triton   # needs a free card
 
-SGLANG_SRC points at the SGLang python tree to import the Triton reference.
+Set SGLANG_SRC to the SGLang python tree to enable --triton.
 """
 
 from __future__ import annotations
@@ -24,8 +24,9 @@ import sys
 
 import torch
 
-SGLANG_SRC = os.environ.get("SGLANG_SRC", "/workspace/restomod/repo/.build/sglang/python")
-if os.path.isdir(SGLANG_SRC):
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SGLANG_SRC = os.environ.get("SGLANG_SRC")
+if SGLANG_SRC:
     sys.path.insert(0, SGLANG_SRC)
 
 from sm70_kernels.gdn_chunk_h import get_chunk_h_kernel
